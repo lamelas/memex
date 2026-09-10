@@ -915,6 +915,7 @@ mod tests {
         options.include_jcode = false;
         options.include_muse = false;
         options.include_antigravity = false;
+        options.include_kiro = false;
         let roots = watch_roots(&options);
         assert_eq!(roots, options.claude_sources);
     }
@@ -1320,6 +1321,7 @@ mod tests {
             mtime,
             offset: metadata.len(),
             turn_id: 1,
+            legacy_turn_id: None,
             parser_version: 1,
             pending_tool_calls: HashMap::new(),
             identity: FileIdentity {

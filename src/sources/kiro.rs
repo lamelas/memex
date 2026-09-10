@@ -297,6 +297,7 @@ pub(crate) fn parse_index_records(
         emit(record)?;
     }
     Ok(IndexParseOutput {
+        legacy_turn_id: None,
         offset,
         turn_id,
         pending_tool_calls,
@@ -379,6 +380,7 @@ mod tests {
         let state = IndexParseState {
             offset: parsed.offset,
             turn_id: parsed.turn_id,
+            legacy_turn_id: parsed.legacy_turn_id,
             pending_tool_calls: parsed.pending_tool_calls,
         };
         let parsed = parse_index_records(&path, state, false, &ids, |r| {
@@ -479,6 +481,7 @@ mod tests {
         let state = IndexParseState {
             offset: parsed.offset,
             turn_id: parsed.turn_id,
+            legacy_turn_id: parsed.legacy_turn_id,
             pending_tool_calls: parsed.pending_tool_calls,
         };
         parse_index_records(&path, state, false, &ids, |r| {

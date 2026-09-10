@@ -6122,7 +6122,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let transcript = dir.join("messages.jsonl");
         let metadata = dir.join("session.json");
-        let user = "{\"id\":\"u\",\"payload\":{\"type\":\"user\",\"content\":\"original\"}}\n";
+        let user = "{\"id\":\"u\",\"payload\":{\"type\":\"user\",\"content\":\"original\",\"images\":[\"file:///tmp/photo.png\"]}}\n";
         fs::write(&transcript, user).unwrap();
         fs::write(
             &metadata,
@@ -6159,6 +6159,13 @@ mod tests {
         let records = index.records_by_session_id("session").unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].project, "second");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                records[0].links.source_content.as_ref().unwrap()
+            )
+            .unwrap(),
+            serde_json::json!([{"type":"image", "image_url":"file:///tmp/photo.png"}])
+        );
         // The periodic scan must detect metadata changes even without a watch event.
         fs::write(
             &metadata,

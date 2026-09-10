@@ -955,6 +955,9 @@ search results; use `--only-source kiro` to select Kiro for indexing.
 User text, assistant replies, tool calls/results, and subagent delegation
 prompts/results are searchable. Reasoning requires `--include-reasoning`.
 Compaction summaries are marked as such; original history remains searchable.
-Snapshots, attachments, diagnostic logs, and operational events are not indexed.
+Image and document attachments, including steering documents, are retained for
+the macOS reader and raw transcripts. Attachment-only messages are preserved;
+attachment contents are not extracted into searchable text. Snapshots,
+diagnostic logs, and other operational events are not indexed.
 This supports the sampled Kiro CLI JSONL format; usage reporting and launching
 Kiro to resume sessions are not supported yet.

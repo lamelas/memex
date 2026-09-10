@@ -12,7 +12,7 @@ use walkdir::WalkDir;
 pub const VERSIONS: ParserVersions = ParserVersions {
     // Refresh analytics for archived workspace project grouping.
     identity: 2,
-    index: 1,
+    index: 2,
     usage: 0,
 };
 
@@ -94,6 +94,46 @@ pub(crate) fn metadata_fingerprint(path: &Path) -> String {
         "{:x}",
         Sha256::digest(serde_json::to_vec(&metadata(path)).expect("metadata strings serialize"))
     )
+}
+
+fn source_content(payload: &Value) -> Result<Option<String>> {
+    let mut blocks = Vec::new();
+    for (field, kind, reference) in [
+        ("images", "image", "image_url"),
+        ("documents", "document", "file_url"),
+    ] {
+        for attachment in payload[field].as_array().into_iter().flatten() {
+            let mut block = match attachment {
+                Value::Object(object) => Value::Object(object.clone()),
+                Value::String(value) if !value.is_empty() => {
+                    serde_json::json!({reference: value})
+                }
+                _ => continue,
+            };
+            block["type"] = kind.into();
+            if let Some(title) = string(attachment, "displayName") {
+                block["title"] = title.into();
+            }
+            if field == "documents" {
+                if let Some(content) = attachment.get("content").and_then(Value::as_str) {
+                    block["source"] = serde_json::json!({"type": "text", "data": content});
+                } else if let Some(id) = string(attachment, "id") {
+                    let key = if id.starts_with("file:") {
+                        "file_url"
+                    } else {
+                        "file_id"
+                    };
+                    block[key] = id.into();
+                }
+            }
+            blocks.push(block);
+        }
+    }
+    if blocks.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(serde_json::to_string(&blocks)?))
+    }
 }
 
 pub(crate) fn parse_index_records(
@@ -196,7 +236,10 @@ pub(crate) fn parse_index_records(
                     }
                 }
                 record.text = string(payload, "content").unwrap_or_default();
-                if record.text.trim().is_empty() {
+                if record.role == "user" || payload["operationType"] == "Say" {
+                    record.links.source_content = source_content(payload)?;
+                }
+                if record.text.trim().is_empty() && record.links.source_content.is_none() {
                     continue;
                 }
                 if event_type == "user" {
@@ -277,6 +320,13 @@ pub(crate) fn parse_index_records(
                     });
                 record.text = record.tool_output.clone().unwrap_or_default();
             }
+            "steering_inclusion" => {
+                record.links.source_content = source_content(payload)?;
+                if record.links.source_content.is_none() {
+                    continue;
+                }
+                record.role = "system".into();
+            }
             "turn_start"
             | "turn_end"
             | "session_start"
@@ -285,7 +335,6 @@ pub(crate) fn parse_index_records(
             | "ContextualHookInvoked"
             | "pending_interaction"
             | "interaction_resolved"
-            | "steering_inclusion"
             | "usage_summary"
             | "tombstone" => continue,
             unknown => {
@@ -316,6 +365,112 @@ mod tests {
     fn event(id: &str, payload: Value) -> String {
         json!({"id": id, "timestamp": "2026-09-04T11:11:05.286Z", "payload": payload}).to_string()
             + "\n"
+    }
+
+    #[test]
+    fn attachments_survive_full_and_incremental_parsing_without_reasoning() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("messages.jsonl");
+        let image = json!({"data":"AAAA", "mimeType":"image/png"});
+        let document = json!({"id":"file:///old/rules.md", "displayName":"Rules",
+            "content":"historical rules", "scope":"workspace"});
+        let prefix = event(
+            "image",
+            json!({"type":"user", "content":"",
+            "images":[image, "file:///tmp/photo.png"], "documents":[]}),
+        );
+        fs::write(&path, &prefix).unwrap();
+        let ids = AtomicU64::new(1);
+        let mut records = Vec::new();
+        let parsed = parse_index_records(&path, IndexParseState::default(), false, &ids, |r| {
+            records.push(r);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].turn_id, 1);
+        let suffix = event(
+            "docs",
+            json!({"type":"steering_inclusion",
+            "documents":["file:///tmp/report.pdf", document]}),
+        ) + &event(
+            "mixed",
+            json!({"type":"user", "content":"Read this",
+                "documents":[{"id":"provider-id", "displayName":"Report"}]}),
+        ) + &event(
+            "reason",
+            json!({"type":"assistant", "operationType":"Reasoning",
+                "content":"private thought", "documents":[document], "reasoningSignature":"secret"}),
+        ) + &event(
+            "empty",
+            json!({"type":"user", "images":[null, 12], "documents":[]}),
+        );
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(suffix.as_bytes())
+            .unwrap();
+        parse_index_records(
+            &path,
+            IndexParseState {
+                offset: parsed.offset,
+                turn_id: parsed.turn_id,
+                legacy_turn_id: parsed.legacy_turn_id,
+                pending_tool_calls: parsed.pending_tool_calls,
+            },
+            false,
+            &ids,
+            |r| {
+                records.push(r);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(records.len(), 3);
+        let blocks = |r: &Record| {
+            serde_json::from_str::<Value>(r.links.source_content.as_ref().unwrap()).unwrap()
+        };
+        assert_eq!(
+            blocks(&records[0]),
+            json!([
+                {"type":"image", "data":"AAAA", "mimeType":"image/png"},
+                {"type":"image", "image_url":"file:///tmp/photo.png"}
+            ])
+        );
+        assert_eq!(records[1].role, "system");
+        assert!(records[1].text.is_empty());
+        assert_eq!(
+            blocks(&records[1])[0],
+            json!({"type":"document", "file_url":"file:///tmp/report.pdf"})
+        );
+        assert_eq!(
+            blocks(&records[1])[1]["source"],
+            json!({"type":"text", "data":"historical rules"})
+        );
+        assert_eq!(blocks(&records[1])[1]["content"], "historical rules");
+        assert_eq!(blocks(&records[2])[0]["file_id"], "provider-id");
+        assert_eq!(records[2].text, "Read this");
+        let mut full = Vec::new();
+        parse_index_records(&path, IndexParseState::default(), true, &ids, |r| {
+            full.push(r);
+            Ok(())
+        })
+        .unwrap();
+        for (incremental, complete) in records.iter().zip(&full) {
+            assert_eq!(
+                incremental.links.source_content,
+                complete.links.source_content
+            );
+            assert_eq!(incremental.turn_id, complete.turn_id);
+            assert_eq!(
+                crate::retrieval::canonical_record_id(incremental),
+                crate::retrieval::canonical_record_id(complete)
+            );
+        }
+        assert_eq!(full.len(), 4);
+        assert_eq!(full[3].role, "reasoning");
+        assert!(full[3].links.source_content.is_none());
     }
 
     #[test]

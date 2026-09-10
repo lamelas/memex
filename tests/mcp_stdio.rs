@@ -400,6 +400,7 @@ fn search_reuses_cli_fusion_projection_and_observes_new_generations() {
             "--no-grok",
             "--no-jcode",
             "--no-muse",
+            "--no-kiro",
             "--no-embeddings",
             "--root",
         ])

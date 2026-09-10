@@ -1208,6 +1208,7 @@ fn parse_source(value: &str) -> Result<SourceFilter> {
         "jcode" => Ok(SourceFilter::Jcode),
         "muse" => Ok(SourceFilter::Muse),
         "antigravity" => Ok(SourceFilter::Antigravity),
+        "kiro" => Ok(SourceFilter::Kiro),
         _ => Err(anyhow!("unknown source: {value}")),
     }
 }

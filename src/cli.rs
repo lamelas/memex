@@ -171,6 +171,12 @@ struct IndexArgs {
     /// Skip indexing Antigravity conversations
     #[arg(long = "no-antigravity", default_value_t = false, hide = true)]
     no_antigravity: bool,
+    /// Index Kiro CLI sessions from ~/.kiro/sessions [default: true]
+    #[arg(long, default_value_t = true, hide = true)]
+    kiro: bool,
+    /// Skip indexing Kiro CLI sessions
+    #[arg(long = "no-kiro", default_value_t = false, hide = true)]
+    no_kiro: bool,
     /// Generate embeddings for semantic search during indexing
     #[arg(long, help_heading = "Embeddings")]
     embeddings: bool,
@@ -307,7 +313,7 @@ OUTPUT FIELDS (--fields):
         /// Filter by session ID
         #[arg(long, help_heading = "Filters")]
         session: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, or muse
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, or kiro
         #[arg(long, help_heading = "Filters")]
         source: Option<SourceFilter>,
         /// Filter by origin: regular (default), interactive, subagent, or all (includes permission reviews)
@@ -618,7 +624,7 @@ EXAMPLES:
         /// Filter by project (repository grouping)
         #[arg(long)]
         project: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, or muse
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, or kiro
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Only include sessions active on or after this date/timestamp
@@ -863,7 +869,7 @@ enum HerdrCommand {
         /// Refuse when no resumable session exists in --cwd instead of using another project
         #[arg(long)]
         strict_cwd: bool,
-        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, or muse
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, or kiro
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Path to memex data directory [default: ~/.memex]
@@ -2156,6 +2162,7 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         include_jcode: index.source_enabled(IndexSource::Jcode),
         include_muse: index.source_enabled(IndexSource::Muse),
         include_antigravity: index.source_enabled(IndexSource::Antigravity),
+        include_kiro: index.source_enabled(IndexSource::Kiro),
         exclude_patterns: excludes,
         embeddings,
         backfill_embeddings: false,
@@ -2389,7 +2396,7 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
     let memory_embedded = embed_memory(&paths, model_choice, &embed_runtime)?;
     progress.finish();
     println!(
-        "embedded {} conversation vectors and {} memory section vectors (claude {}, codex {}, opencode {}, cursor {}, pi {}, openclaw {}, copilot {}, jcode {}, muse {}, grok {})",
+        "embedded {} conversation vectors and {} memory section vectors (claude {}, codex {}, opencode {}, cursor {}, pi {}, openclaw {}, copilot {}, jcode {}, muse {}, grok {}, kiro {})",
         embedded_total,
         memory_embedded,
         embedded_counts[crate::types::SourceKind::Claude.idx()],
@@ -2402,6 +2409,7 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
         embedded_counts[crate::types::SourceKind::Jcode.idx()],
         embedded_counts[crate::types::SourceKind::Muse.idx()],
         embedded_counts[crate::types::SourceKind::Grok.idx()],
+        embedded_counts[crate::types::SourceKind::Kiro.idx()],
     );
 
     std::io::stdout().flush().ok();
@@ -5481,6 +5489,7 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
         crate::types::SourceKind::Jcode => "jcode",
         crate::types::SourceKind::Muse => "muse",
         crate::types::SourceKind::Antigravity => "antigravity",
+        crate::types::SourceKind::Kiro => "kiro",
     };
     let source_path = &record.source_path;
 
@@ -6782,6 +6791,9 @@ fn build_index_command_args(
     }
     if !index.jcode || index.no_jcode {
         args.push("--no-jcode".to_string());
+    }
+    if !index.kiro || index.no_kiro {
+        args.push("--no-kiro".to_string());
     }
     if !index.muse || index.no_muse {
         args.push("--no-muse".to_string());
@@ -8135,6 +8147,7 @@ mod tests {
             jcode: false,
             muse: false,
             antigravity: false,
+            kiro: false,
             no_codex: false,
             no_opencode: false,
             no_pi: false,
@@ -8145,6 +8158,7 @@ mod tests {
             no_jcode: false,
             no_muse: false,
             no_antigravity: false,
+            no_kiro: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
@@ -8194,6 +8208,7 @@ mod tests {
             jcode: true,
             muse: true,
             antigravity: true,
+            kiro: true,
             no_codex: false,
             no_opencode: false,
             no_pi: false,
@@ -8204,6 +8219,7 @@ mod tests {
             no_jcode: false,
             no_muse: false,
             no_antigravity: false,
+            no_kiro: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
@@ -8247,6 +8263,7 @@ mod tests {
             jcode: true,
             muse: true,
             antigravity: true,
+            kiro: true,
             no_codex: false,
             no_opencode: false,
             no_pi: false,
@@ -8257,6 +8274,7 @@ mod tests {
             no_jcode: false,
             no_muse: false,
             no_antigravity: false,
+            no_kiro: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
@@ -8302,6 +8320,7 @@ mod tests {
             jcode: true,
             muse: true,
             antigravity: true,
+            kiro: true,
             no_codex: false,
             no_opencode: false,
             no_pi: false,
@@ -8312,6 +8331,7 @@ mod tests {
             no_jcode: false,
             no_muse: false,
             no_antigravity: false,
+            no_kiro: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
@@ -9016,6 +9036,7 @@ arguments = {
             "--no-grok",
             "--no-jcode",
             "--no-muse",
+            "--no-kiro",
         ])
         .unwrap();
 

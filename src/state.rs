@@ -7,6 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileIdentity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_metadata_sha256: Option<String>,
     /// SQLite commits can change only the WAL while the main file stays unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sqlite_wal: Option<SqliteWalIdentity>,

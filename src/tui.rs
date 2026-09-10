@@ -418,6 +418,7 @@ enum SourceChoice {
     Jcode,
     Muse,
     Antigravity,
+    Kiro,
 }
 
 impl SourceChoice {
@@ -436,7 +437,8 @@ impl SourceChoice {
             SourceChoice::Hermes => SourceChoice::Jcode,
             SourceChoice::Jcode => SourceChoice::Muse,
             SourceChoice::Muse => SourceChoice::Antigravity,
-            SourceChoice::Antigravity => SourceChoice::All,
+            SourceChoice::Antigravity => SourceChoice::Kiro,
+            SourceChoice::Kiro => SourceChoice::All,
         }
     }
 
@@ -456,6 +458,7 @@ impl SourceChoice {
             SourceChoice::Jcode => Some(SourceFilter::Jcode),
             SourceChoice::Muse => Some(SourceFilter::Muse),
             SourceChoice::Antigravity => Some(SourceFilter::Antigravity),
+            SourceChoice::Kiro => Some(SourceFilter::Kiro),
         }
     }
 
@@ -475,6 +478,7 @@ impl SourceChoice {
             SourceChoice::Jcode => "jcode",
             SourceChoice::Muse => "muse",
             SourceChoice::Antigravity => "antigravity",
+            SourceChoice::Kiro => "kiro",
         }
     }
 
@@ -493,6 +497,7 @@ impl SourceChoice {
             SourceKind::Jcode => SourceChoice::Jcode,
             SourceKind::Muse => SourceChoice::Muse,
             SourceKind::Antigravity => SourceChoice::Antigravity,
+            SourceKind::Kiro => SourceChoice::Kiro,
         }
     }
 }
@@ -1169,6 +1174,7 @@ impl App {
                     include_jcode: true,
                     include_muse: true,
                     include_antigravity: true,
+                    include_kiro: true,
                     exclude_patterns: config.exclude_path_patterns(),
                     embeddings: embeddings_default,
                     backfill_embeddings: false,
@@ -2658,6 +2664,7 @@ impl App {
             SourceKind::Jcode => "jcode",
             SourceKind::Muse => "muse",
             SourceKind::Antigravity => "antigravity",
+            SourceKind::Kiro => "kiro",
         };
         let source_path = session.source_path.clone();
 
@@ -4115,6 +4122,7 @@ fn source_choice_matches_storage_label(choice: SourceChoice, label: &str) -> boo
         SourceChoice::Jcode => label == "jcode",
         SourceChoice::Muse => label == "muse",
         SourceChoice::Antigravity => label == "antigravity",
+        SourceChoice::Kiro => label == "kiro",
         SourceChoice::All => false,
     }
 }
@@ -4134,6 +4142,7 @@ fn source_color(source: SourceKind) -> Color {
         SourceKind::Jcode => Color::Rgb(220, 140, 180),
         SourceKind::Muse => Color::Rgb(180, 130, 240),
         SourceKind::Antigravity => Color::Rgb(120, 200, 140),
+        SourceKind::Kiro => Color::Rgb(180, 130, 240),
     }
 }
 

@@ -46,6 +46,7 @@ pub struct IngestOptions {
     pub include_jcode: bool,
     pub include_muse: bool,
     pub include_antigravity: bool,
+    pub include_kiro: bool,
     pub exclude_patterns: Vec<String>,
     pub embeddings: bool,
     pub backfill_embeddings: bool,
@@ -156,6 +157,7 @@ fn file_identity(path: &Path, metadata: &std::fs::Metadata, prefix_bytes: usize)
     };
 
     FileIdentity {
+        source_metadata_sha256: None,
         sqlite_wal: None,
         #[cfg(unix)]
         device: Some(metadata.dev()),
@@ -227,13 +229,17 @@ fn prepare_file_task(
     if source == SourceKind::Antigravity && crate::sources::antigravity::is_db_path(&path) {
         identity.sqlite_wal = Some(crate::state::SqliteWalIdentity::read(&path));
     }
+    if source == SourceKind::Kiro {
+        identity.source_metadata_sha256 = Some(crate::sources::kiro::metadata_fingerprint(&path));
+    }
     let parser_version = crate::sources::index_state_version_for(source, include_reasoning);
     let parser_version_invalidated =
         previous.is_some_and(|previous| previous.parser_version != parser_version);
     let (offset, turn_id, delete_first, pending_tool_calls, skip) = match previous {
         None => (0, 0, false, HashMap::new(), false),
         Some(previous)
-            if size < previous.size
+            if identity.source_metadata_sha256 != previous.identity.source_metadata_sha256
+                || size < previous.size
                 || mtime < previous.mtime
                 || previous.parser_version != parser_version
                 || file_was_replaced(&previous.identity, &identity)
@@ -1457,6 +1463,35 @@ fn ingest_selected(
             tasks.push(task);
         }
     }
+    if options.include_kiro && full_scan {
+        let kiro_files = crate::sources::kiro::discover();
+        for source_file in kiro_files {
+            let path = source_file.path;
+            if excluder.is_excluded(&path) {
+                files_skipped += 1;
+                continue;
+            }
+            let Some(meta) = discovered_metadata(&path)? else {
+                files_skipped += 1;
+                continue;
+            };
+            files_scanned += 1;
+            total_bytes += meta.len();
+            let key = path.to_string_lossy().to_string();
+            let (task, skip) = prepare_file_task(
+                path,
+                SourceKind::Kiro,
+                options.include_reasoning,
+                &meta,
+                state.files.get(&key),
+            );
+            if skip {
+                files_skipped += 1;
+                continue;
+            }
+            tasks.push(task);
+        }
+    }
 
     // Previously indexed records under now-excluded paths must be deleted even
     // when there is no ingest state entry for them (e.g. state loss or legacy runs).
@@ -1769,6 +1804,14 @@ fn ingest_selected(
                     &progress,
                 ),
                 SourceKind::Antigravity => parse_antigravity_file(
+                    task,
+                    options.include_reasoning,
+                    &tx_record,
+                    &tx_update,
+                    &next_doc_id,
+                    &progress,
+                ),
+                SourceKind::Kiro => parse_kiro_file(
                     task,
                     options.include_reasoning,
                     &tx_record,
@@ -2511,6 +2554,39 @@ fn parse_antigravity_file(
     )
 }
 
+fn parse_kiro_file(
+    task: &FileTask,
+    include_reasoning: bool,
+    tx_record: &RecordSender,
+    tx_update: &Sender<FileUpdate>,
+    next_doc_id: &AtomicU64,
+    progress: &Arc<Progress>,
+) -> Result<()> {
+    let source_path = task.path.to_string_lossy().to_string();
+    let parsed = crate::sources::kiro::parse_index_records(
+        &task.path,
+        crate::sources::IndexParseState {
+            offset: task.offset,
+            turn_id: task.turn_id,
+            pending_tool_calls: task.pending_tool_calls.clone(),
+        },
+        include_reasoning,
+        next_doc_id,
+        |record| {
+            progress.add_produced(SourceKind::Kiro, 1);
+            tx_record.send(record)
+        },
+    )?;
+    finish_source_parse(
+        task,
+        tx_update,
+        progress,
+        SourceKind::Kiro,
+        source_path,
+        parsed,
+    )
+}
+
 fn parse_cursor_file(
     task: &FileTask,
     tx_record: &RecordSender,
@@ -2878,6 +2954,7 @@ mod tests {
             include_jcode: false,
             include_muse: false,
             include_antigravity: false,
+            include_kiro: false,
             embeddings,
             backfill_embeddings: false,
             model,
@@ -5014,6 +5091,7 @@ mod tests {
     #[test]
     fn device_renumbering_preserves_append_continuity() {
         let previous = FileIdentity {
+            source_metadata_sha256: None,
             device: Some(1),
             inode: Some(2),
             prefix_sha256: Some("same".to_string()),
@@ -5032,6 +5110,7 @@ mod tests {
     #[test]
     fn device_renumbering_does_not_hide_file_replacement() {
         let previous = FileIdentity {
+            source_metadata_sha256: None,
             device: Some(1),
             inode: Some(2),
             prefix_sha256: Some("original".to_string()),
@@ -5300,6 +5379,7 @@ mod tests {
             include_jcode: false,
             include_muse: false,
             include_antigravity: false,
+            include_kiro: false,
             embeddings: false,
             backfill_embeddings: false,
             model: ModelChoice::default(),
@@ -5743,6 +5823,7 @@ mod tests {
             include_jcode: false,
             include_muse: false,
             include_antigravity: false,
+            include_kiro: false,
             embeddings: false,
             backfill_embeddings: false,
             model: ModelChoice::default(),
@@ -5890,6 +5971,93 @@ mod tests {
             records
                 .iter()
                 .all(|record| record.source_path == session_file.to_string_lossy())
+        );
+    }
+
+    #[test]
+    fn kiro_ingest_reconciles_metadata_appends_and_replacement() {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("kiro");
+        let dir = root.join("workspace/session");
+        fs::create_dir_all(&dir).unwrap();
+        let transcript = dir.join("messages.jsonl");
+        let metadata = dir.join("session.json");
+        let user = "{\"id\":\"u\",\"payload\":{\"type\":\"user\",\"content\":\"original\"}}\n";
+        fs::write(&transcript, user).unwrap();
+        fs::write(
+            &metadata,
+            r#"{"id":"session","workspacePaths":["/work/first"]}"#,
+        )
+        .unwrap();
+        let _env = EnvVarGuard::set_os(&[("KIRO_SESSIONS_DIR", Some(root.as_os_str()))]);
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let index = SearchIndex::open_or_create(&paths.index).unwrap();
+        let mut options = ingest_options(false, ModelChoice::default());
+        options.include_kiro = true;
+        let lease = ingest_lease(&paths);
+        assert_eq!(
+            ingest_all(&paths, &index, &options, &lease)
+                .unwrap()
+                .records_added,
+            1
+        );
+        assert_eq!(
+            ingest_all(&paths, &index, &options, &lease)
+                .unwrap()
+                .records_added,
+            0
+        );
+        fs::write(
+            &metadata,
+            r#"{"id":"session","workspacePaths":["/work/second"]}"#,
+        )
+        .unwrap();
+        let dirty = HashSet::from([metadata.clone()]);
+        let result = ingest_dirty(&paths, &index, &options, &lease, &dirty).unwrap();
+        assert!(!result.full_scan);
+        let records = index.records_by_session_id("session").unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].project, "second");
+        // The periodic scan must detect metadata changes even without a watch event.
+        fs::write(
+            &metadata,
+            r#"{"id":"session","workspacePaths":["/work/third"]}"#,
+        )
+        .unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap();
+        assert_eq!(
+            index.records_by_session_id("session").unwrap()[0].project,
+            "third"
+        );
+        let response = "{\"id\":\"a\",\"payload\":{\"type\":\"assistant\",\"operationType\":\"Say\",\"content\":\"answer\"}}\n";
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap()
+            .write_all(response.as_bytes())
+            .unwrap();
+        ingest_dirty(
+            &paths,
+            &index,
+            &options,
+            &lease,
+            &HashSet::from([transcript.clone()]),
+        )
+        .unwrap();
+        assert_eq!(index.records_by_session_id("session").unwrap().len(), 2);
+        fs::write(&transcript, response).unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap();
+        let records = index.records_by_session_id("session").unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].text, "answer");
+        options.include_kiro = false;
+        assert_eq!(
+            ingest_all(&paths, &index, &options, &lease)
+                .unwrap()
+                .files_scanned,
+            0
         );
     }
 

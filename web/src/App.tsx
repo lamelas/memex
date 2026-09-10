@@ -1066,6 +1066,7 @@ function App() {
                   <SelectItem value="pi">Pi</SelectItem>
                   <SelectItem value="openclaw">OpenClaw</SelectItem>
                   <SelectItem value="copilot">Copilot</SelectItem>
+                  <SelectItem value="kiro">Kiro</SelectItem>
                 </SelectGroup>
               </SelectContent>
             </Select>
@@ -1394,6 +1395,7 @@ function App() {
                           <SelectItem value="pi">Pi</SelectItem>
                           <SelectItem value="openclaw">OpenClaw</SelectItem>
                           <SelectItem value="copilot">Copilot</SelectItem>
+                          <SelectItem value="kiro">Kiro</SelectItem>
                         </SelectGroup>
                       </SelectContent>
                     </Select>

@@ -14,6 +14,7 @@ pub mod cursor;
 pub mod grok;
 pub mod hermes;
 pub mod jcode;
+pub mod kiro;
 pub mod muse;
 pub mod omp;
 pub mod openclaw;
@@ -257,6 +258,7 @@ pub fn versions(source: SourceKind) -> ParserVersions {
         SourceKind::Jcode => jcode::VERSIONS,
         SourceKind::Muse => muse::VERSIONS,
         SourceKind::Antigravity => antigravity::VERSIONS,
+        SourceKind::Kiro => kiro::VERSIONS,
     }
 }
 
@@ -279,6 +281,7 @@ pub fn index_state_version_for(source: SourceKind, include_reasoning: bool) -> u
                 | SourceKind::Muse
                 | SourceKind::Grok
                 | SourceKind::Antigravity
+                | SourceKind::Kiro
         );
     (versions.identity.saturating_mul(10_000) + versions.index)
         .saturating_mul(2)
@@ -298,6 +301,8 @@ pub fn classify_path(path: &str) -> SourceKind {
         SourceKind::Muse
     } else if antigravity::matches_path(path) {
         SourceKind::Antigravity
+    } else if kiro::matches_path(path) {
+        SourceKind::Kiro
     } else if grok::matches_path(path) {
         SourceKind::Grok
     } else if cursor::matches_path(path) {
@@ -332,6 +337,7 @@ mod tests {
             SourceKind::Opencode,
             SourceKind::Jcode,
             SourceKind::Muse,
+            SourceKind::Kiro,
             SourceKind::Grok,
         ] {
             assert_ne!(

@@ -32,6 +32,7 @@ enum Shape {
     Jcode,
     Muse,
     Antigravity,
+    Kiro,
 }
 
 struct Root {
@@ -115,6 +116,9 @@ fn roots(options: &IngestOptions) -> Vec<Root> {
     }
     if options.include_jcode {
         roots.push(Root::new(sources::jcode::sessions_root(), Shape::Jcode));
+    }
+    if options.include_kiro {
+        roots.push(Root::new(sources::kiro::sessions_root(), Shape::Kiro));
     }
     if options.include_muse {
         roots.push(Root::new(sources::muse::sessions_root(), Shape::Muse));
@@ -213,6 +217,7 @@ fn classify(root: &Root, path: &Path) -> Match {
             (name.starts_with("session_") && name.ends_with(".json")).then_some(SourceKind::Jcode)
         }
         Shape::Muse => (name == "session.jsonl").then_some(SourceKind::Muse),
+        Shape::Kiro => (parts.len() == 3 && name == "messages.jsonl").then_some(SourceKind::Kiro),
         Shape::Antigravity => {
             let in_profile = parts.first().is_some_and(|part| {
                 *part == "antigravity-ide"
@@ -249,9 +254,20 @@ fn resolve(
         let mut matches = Vec::new();
         let mut known_unmatched = false;
         for root in roots {
-            let Some(path) = root.remap(hint) else {
+            let Some(mut path) = root.remap(hint) else {
                 continue;
             };
+            if matches!(root.shape, Shape::Kiro)
+                && path
+                    .strip_prefix(&root.lexical)
+                    .is_ok_and(|p| p.components().count() == 3)
+                && path.file_name().is_some_and(|n| n == "session.json")
+            {
+                path.set_file_name("messages.jsonl");
+                if !path.exists() && !state.files.contains_key(path.to_string_lossy().as_ref()) {
+                    continue;
+                }
+            }
             if excluder.is_excluded(&path) || excluder.is_excluded(hint) {
                 continue;
             }
@@ -425,6 +441,7 @@ mod tests {
             include_jcode: false,
             include_muse: false,
             include_antigravity: false,
+            include_kiro: false,
             exclude_patterns: Vec::new(),
             embeddings: false,
             backfill_embeddings: false,
@@ -553,6 +570,8 @@ mod tests {
             (Shape::Grok, "a/b/c/updates.jsonl"),
             (Shape::Jcode, "notes.json"),
             (Shape::Muse, "notes.jsonl"),
+            (Shape::Kiro, "project/id/snapshots/messages.jsonl"),
+            (Shape::Kiro, "project/id/session.json"),
             (Shape::Opencode, "nested/opencode.db"),
             (Shape::Opencode, "other.db-wal"),
             (Shape::CodexHome, "settings.json"),

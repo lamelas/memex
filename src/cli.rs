@@ -4642,7 +4642,7 @@ fn print_usage_rows(
     cache_waste: &crate::usage::CacheWaste,
     by_source: &[crate::usage::UsageSummary],
 ) {
-    const HEADERS: [&str; 10] = [
+    const HEADERS: [&str; 11] = [
         "source",
         "events",
         "input",
@@ -4651,6 +4651,7 @@ fn print_usage_rows(
         "output",
         "total",
         "cost",
+        "credits",
         "hit",
         "re-billed",
     ];
@@ -4669,23 +4670,37 @@ fn print_usage_rows(
         totals.cache_read += row.cache_read;
         totals.cache_write += row.cache_write;
         totals.output += row.output;
+        totals.unavailable_token_events += row.unavailable_token_events;
+        if let Some(credits) = row.credits {
+            *totals.credits.get_or_insert(0.0) += credits;
+        }
     }
-    let cells = |row: &crate::usage::UsageSummary| -> [String; 10] {
+    let cells = |row: &crate::usage::UsageSummary| -> [String; 11] {
         let prompt_tokens = row.uncached_input + row.cache_read + row.cache_write;
         let cache_active = row.cache_read > 0 || row.cache_write > 0;
+        let token_count = |value| {
+            if row.events > 0 && row.unavailable_token_events == row.events {
+                "unavailable".to_string()
+            } else {
+                format_count(value)
+            }
+        };
         [
             row.source.clone(),
             format_count(row.events),
-            format_count(row.uncached_input),
-            format_count(row.cache_read),
-            format_count(row.cache_write),
-            format_count(row.output),
-            format_count(row.total_tokens),
+            token_count(row.uncached_input),
+            token_count(row.cache_read),
+            token_count(row.cache_write),
+            token_count(row.output),
+            token_count(row.total_tokens),
             if row.priced_events > 0 {
                 format_usd(row.known_cost_usd)
             } else {
                 "-".to_string()
             },
+            row.credits
+                .map(|credits| format!("{credits:.6}"))
+                .unwrap_or_else(|| "-".into()),
             if cache_active && prompt_tokens > 0 {
                 format!(
                     "{:.1}%",
@@ -4703,10 +4718,10 @@ fn print_usage_rows(
             },
         ]
     };
-    let mut table: Vec<[String; 10]> = vec![HEADERS.map(str::to_string)];
+    let mut table: Vec<[String; 11]> = vec![HEADERS.map(str::to_string)];
     table.extend(by_source.iter().map(cells));
     table.push(cells(&totals));
-    let mut widths = [0usize; 10];
+    let mut widths = [0usize; 11];
     for row in &table {
         for (width, cell) in widths.iter_mut().zip(row) {
             *width = (*width).max(cell.len());

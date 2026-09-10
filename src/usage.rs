@@ -113,6 +113,10 @@ pub struct UsageEvent {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub tokens: TokenBuckets,
+    /// Provider-reported credits; these are neither tokens nor a dollar cost.
+    pub credits: Option<f64>,
+    /// False means token buckets are unavailable, not measured zero usage.
+    pub token_usage_available: bool,
     pub source_cost_usd: Option<f64>,
     /// A missing source cost is intentionally covered by an authoritative aggregate.
     #[serde(skip)]
@@ -140,6 +144,10 @@ pub struct UsageSummary {
     pub output: u64,
     pub reasoning: u64,
     pub total_tokens: u64,
+    #[serde(default)]
+    pub credits: Option<f64>,
+    #[serde(default)]
+    pub unavailable_token_events: u64,
     pub known_cost_usd: f64,
     pub priced_events: u64,
     pub unpriced_events: u64,
@@ -178,6 +186,8 @@ pub struct UsageReport {
     pub authority: &'static str,
     pub events: u64,
     pub total_tokens: u64,
+    pub credits: Option<f64>,
+    pub unavailable_token_events: u64,
     pub unknown_model_events: u64,
     pub conservative_events: u64,
     pub cost_mode: CostMode,
@@ -208,14 +218,19 @@ pub fn scan_usage_activity(query: &UsageQuery) -> Result<(Vec<UsageActivityPoint
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (assembled, warnings) = memoized_usage_events(query);
+    let mut unavailable = query.source == Some(SourceFilter::Kiro);
     let points = filtered_events(&assembled, query)
+        .filter(|event| {
+            unavailable |= !event.token_usage_available;
+            event.token_usage_available
+        })
         .map(|event| UsageActivityPoint {
             source: event.source,
             timestamp_ms: event.timestamp_ms,
             total_tokens: event.tokens.total(),
         })
         .collect();
-    Ok((points, !warnings.is_empty()))
+    Ok((points, unavailable || !warnings.is_empty()))
 }
 
 /// Assembled events are already sorted; filtering preserves that order.
@@ -234,6 +249,16 @@ fn filtered_events<'a>(
                 .is_none_or(|until| event.timestamp_ms < until)
             && query.project.as_deref().is_none_or(|project| {
                 event.project.as_deref().is_some_and(|candidate| {
+                    let archived_project;
+                    let candidate = if event.source == "kiro"
+                        && query.project_grouping == ProjectGrouping::Repository
+                        && !Path::new(candidate).exists()
+                    {
+                        archived_project = crate::sources::common::project_from_path(candidate);
+                        &archived_project
+                    } else {
+                        candidate
+                    };
                     usage_project_matches(
                         candidate,
                         project,
@@ -268,8 +293,13 @@ pub fn scan_usage(query: &UsageQuery) -> Result<UsageReport> {
     for event in events.iter().copied() {
         let total = event.tokens.additive_total();
         report.events += 1;
+        report.unavailable_token_events += u64::from(!event.token_usage_available);
+        if let Some(credits) = event.credits {
+            *report.credits.get_or_insert(0.0) += credits;
+        }
         report.total_tokens = report.total_tokens.saturating_add(total);
-        report.unknown_model_events += u64::from(event.model.is_none());
+        report.unknown_model_events +=
+            u64::from(event.token_usage_available && event.model.is_none());
         report.conservative_events += u64::from(event.conservative_undercount);
         let cost = event_cost_nanos(event, query.cost_mode);
         if let Some(cost) = cost {
@@ -285,6 +315,10 @@ pub fn scan_usage(query: &UsageQuery) -> Result<UsageReport> {
                 ..UsageSummary::default()
             });
         row.events += 1;
+        row.unavailable_token_events += u64::from(!event.token_usage_available);
+        if let Some(credits) = event.credits {
+            *row.credits.get_or_insert(0.0) += credits;
+        }
         row.uncached_input = row
             .uncached_input
             .saturating_add(event.tokens.uncached_input);
@@ -518,7 +552,7 @@ fn assemble_usage_events(
     };
     type SourceScanner =
         fn(&mut Vec<UsageEvent>, &mut Vec<String>, Option<&mut UsageCache>) -> Result<()>;
-    const SCANNERS: [(SourceFilter, SourceScanner); 13] = [
+    const SCANNERS: [(SourceFilter, SourceScanner); 14] = [
         (SourceFilter::Claude, scan_claude),
         (SourceFilter::Codex, scan_codex),
         (SourceFilter::Opencode, scan_opencode),
@@ -531,6 +565,7 @@ fn assemble_usage_events(
         (SourceFilter::Hermes, scan_hermes),
         (SourceFilter::Jcode, scan_jcode),
         (SourceFilter::Muse, scan_muse),
+        (SourceFilter::Kiro, scan_kiro),
         (SourceFilter::Antigravity, scan_antigravity),
     ];
     for (filter, scanner) in SCANNERS {
@@ -542,6 +577,7 @@ fn assemble_usage_events(
             usage_timing(scanner_start, || format!("{} scanner", filter.as_str()));
         }
     }
+    crate::sources::kiro::reconcile_usage(&mut events);
     publish_scan_progress(None);
 
     let reconcile_start = Instant::now();
@@ -674,6 +710,8 @@ struct CachedUsageEvent {
     provider: Option<String>,
     model: Option<String>,
     tokens: TokenBuckets,
+    credits: Option<f64>,
+    token_usage_available: bool,
     source_cost_usd: Option<f64>,
     cost_authoritative: bool,
     dedupe_confidence: String,
@@ -696,6 +734,8 @@ impl CachedUsageEvent {
             provider: event.provider.clone(),
             model: event.model.clone(),
             tokens: event.tokens.clone(),
+            credits: event.credits,
+            token_usage_available: event.token_usage_available,
             source_cost_usd: event.source_cost_usd,
             cost_authoritative: event.cost_authoritative,
             dedupe_confidence: event.dedupe_confidence.to_string(),
@@ -720,6 +760,8 @@ impl CachedUsageEvent {
             provider: self.provider,
             model: self.model,
             tokens: self.tokens,
+            credits: self.credits,
+            token_usage_available: self.token_usage_available,
             source_cost_usd: self.source_cost_usd,
             cost_authoritative: self.cost_authoritative,
             dedupe_confidence: match self.dedupe_confidence.as_str() {
@@ -793,9 +835,9 @@ impl UsageCache {
         // when its event layout changes so old rows cannot decode with shifted fields.
         let event_format: i64 =
             connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if event_format != 1 {
+        if event_format != 2 {
             connection
-                .execute_batch("DROP TABLE IF EXISTS usage_file_cache; PRAGMA user_version = 1;")?;
+                .execute_batch("DROP TABLE IF EXISTS usage_file_cache; PRAGMA user_version = 2;")?;
         }
         // Drop pre-postcard cache tables and any schema missing a required column: the
         // JSON-era claude table, the pre-rename blob column, and the deps_blob column that
@@ -1490,6 +1532,33 @@ fn scan_muse(
     Ok(())
 }
 
+fn scan_kiro(
+    out: &mut Vec<UsageEvent>,
+    warnings: &mut Vec<String>,
+    cache: Option<&mut UsageCache>,
+) -> Result<()> {
+    let files = crate::sources::kiro::discover()
+        .into_iter()
+        .map(|file| file.path)
+        .collect::<Vec<_>>();
+    scan_files_cached(
+        SourceScan {
+            source: "kiro",
+            parser_version: crate::sources::kiro::VERSIONS.usage,
+            volatile_reuse_ms: |_| None,
+        },
+        &files,
+        cache,
+        warnings,
+        out,
+        crate::sources::kiro::parse_usage_file,
+    );
+    if !files.is_empty() {
+        warnings.push("Kiro reports credits; token usage and dollar costs are unavailable.".into());
+    }
+    Ok(())
+}
+
 fn scan_antigravity(
     out: &mut Vec<UsageEvent>,
     warnings: &mut Vec<String>,
@@ -1529,6 +1598,9 @@ const fn usd_per_million(value_milli_usd: u64) -> u64 {
 }
 
 pub(crate) fn event_cost_nanos(event: &UsageEvent, mode: CostMode) -> Option<u64> {
+    if !event.token_usage_available {
+        return None;
+    }
     let source = event
         .source_cost_usd
         .filter(|value| value.is_finite() && *value >= 0.0)
@@ -1660,6 +1732,141 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    fn kiro_credits_are_cached_deduplicated_filtered_and_never_priced_as_tokens() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("kiro");
+        let _env = EnvVarGuard::set_os(&[("KIRO_SESSIONS_DIR", Some(root.as_os_str()))]);
+        let event = |id: &str, execution: &str, time: &str, amounts: serde_json::Value| {
+            serde_json::json!({"id":id,"timestamp":time,"payload":{"type":"usage_summary",
+                "executionId":execution,"promptTurnSummaries":amounts}})
+            .to_string()
+                + "\n"
+        };
+        let amounts = |amount| serde_json::json!([{"unit":"credit","usage":amount}]);
+        let first = event("a", "execution-1", "2026-09-05T12:00:00Z", amounts(0.25));
+        let updated = event("b", "execution-1", "2026-09-05T12:01:00Z", amounts(0.5));
+        let second = event(
+            "c",
+            "execution-2",
+            "2026-09-05T13:00:00Z",
+            serde_json::json!([{"unit":"credit","usage":0.125},{"unit":"credit","usage":0.125}]),
+        );
+        for copy in ["original", "copy"] {
+            let dir = root.join(copy).join("session");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("session.json"),
+                r#"{"id":"session","workspacePaths":["/work/project"]}"#,
+            )
+            .unwrap();
+            fs::write(
+                dir.join("messages.jsonl"),
+                first.clone() + &updated + &second,
+            )
+            .unwrap();
+        }
+        let mut query = UsageQuery {
+            source: Some(SourceFilter::Kiro),
+            include_events: true,
+            cache_path: Some(tmp.path().join("usage.sqlite")),
+            ..Default::default()
+        };
+        for cost_mode in [CostMode::Auto, CostMode::Reprice, CostMode::Source] {
+            query.cost_mode = cost_mode;
+            let report = scan_usage(&query).unwrap();
+            assert_eq!(report.credits, Some(0.75));
+            assert_eq!(report.events, 2);
+            assert_eq!(report.unavailable_token_events, 2);
+            assert_eq!(report.total_tokens, 0);
+            assert_eq!(report.priced_events, 0);
+            assert_eq!(report.known_cost_usd, 0.0);
+            assert_eq!(report.by_source[0].credits, Some(0.75));
+            assert_eq!(report.cache_waste.miss_count, 0);
+            assert!(report.details.iter().all(|e| !e.token_usage_available));
+            assert_eq!(
+                serde_json::to_value(&report.details[0]).unwrap()["token_usage_available"],
+                false
+            );
+        }
+        let (activity, partial) = scan_usage_activity(&query).unwrap();
+        assert!(activity.is_empty());
+        assert!(partial);
+        query.since_ms =
+            Some(crate::sources::common::parse_iso_millis("2026-09-05T12:30:00Z").unwrap());
+        assert_eq!(scan_usage(&query).unwrap().credits, Some(0.25));
+        query.until_ms =
+            Some(crate::sources::common::parse_iso_millis("2026-09-05T13:00:00Z").unwrap());
+        assert_eq!(scan_usage(&query).unwrap().credits, None);
+        query.since_ms = None;
+        query.until_ms = None;
+        query.project = Some("other".into());
+        assert_eq!(scan_usage(&query).unwrap().credits, None);
+        query.project = Some("project".into());
+        assert_eq!(scan_usage(&query).unwrap().credits, Some(0.75));
+        query.project_grouping = ProjectGrouping::Repository;
+        assert_eq!(scan_usage(&query).unwrap().credits, Some(0.75));
+        query.project_grouping = ProjectGrouping::Flat;
+        query.session_keys = Some(HashSet::new());
+        assert_eq!(scan_usage(&query).unwrap().credits, None);
+        query.session_keys = None;
+        // Changed sidecar metadata invalidates cached project attribution.
+        for copy in ["original", "copy"] {
+            fs::write(
+                root.join(copy).join("session/session.json"),
+                r#"{"id":"session","workspacePaths":["/work/renamed"]}"#,
+            )
+            .unwrap();
+        }
+        assert_eq!(scan_usage(&query).unwrap().credits, None);
+        query.project = None;
+        let path = root.join("original/session/messages.jsonl");
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let tail = event("d", "execution-3", "2026-09-05T14:00:00Z", amounts(0.125));
+        file.write_all(tail.trim_end().as_bytes()).unwrap();
+        assert_eq!(scan_usage(&query).unwrap().credits, Some(0.75));
+        file.write_all(b"\n").unwrap();
+        assert_eq!(scan_usage(&query).unwrap().credits, Some(0.875));
+        let invalid = tmp.path().join("invalid.jsonl");
+        fs::write(
+            &invalid,
+            event("bad", "bad", "2026-09-05T14:00:00Z", amounts(-1.0)),
+        )
+        .unwrap();
+        assert!(crate::sources::kiro::parse_usage_file(&invalid).is_err());
+        fs::write(
+            &invalid,
+            event("zero", "zero", "2026-09-05T14:00:00Z", amounts(0.0)),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::sources::kiro::parse_usage_file(&invalid)
+                .unwrap()
+                .events[0]
+                .credits,
+            Some(0.0)
+        );
+        fs::write(
+            &invalid,
+            event(
+                "empty",
+                "empty",
+                "2026-09-05T14:00:00Z",
+                serde_json::json!([]),
+            ),
+        )
+        .unwrap();
+        assert!(
+            crate::sources::kiro::parse_usage_file(&invalid)
+                .unwrap()
+                .events
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn volatile_sqlite_usage_refreshes_held_open_wal_after_reuse_window() {
         for source in ["opencode", "cursor"] {
             let temp = tempfile::tempdir().unwrap();
@@ -1754,7 +1961,7 @@ mod tests {
                 "INSERT INTO usage_file_cache(source, path, parser_version, size, mtime_ns,
                  scanned_at_ms, events_blob, deps_blob)
              VALUES ('codex', '/tmp/review.jsonl', 1, 10, 20, 30, X'00', X'00');
-             PRAGMA user_version = 0;",
+             PRAGMA user_version = 1;",
             )
             .expect("seed older event layout");
         drop(cache);
@@ -1771,7 +1978,7 @@ mod tests {
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            1
+            2
         );
     }
 
@@ -2285,6 +2492,8 @@ mod tests {
                 output: 10,
                 reasoning: 0,
             },
+            credits: None,
+            token_usage_available: true,
             source_cost_usd: None,
             cost_authoritative: false,
             dedupe_confidence: "exact",
@@ -3550,6 +3759,8 @@ mod tests {
             provider: Some("anthropic".into()),
             model: Some("claude-sonnet-4-6".into()),
             tokens,
+            credits: None,
+            token_usage_available: true,
             source_cost_usd: None,
             cost_authoritative: false,
             dedupe_confidence: "exact",
@@ -3577,6 +3788,8 @@ mod tests {
             provider: Some("anthropic".into()),
             model: Some("claude-sonnet-4-6".into()),
             tokens: TokenBuckets::disjoint(100, 0, 0, 0),
+            credits: None,
+            token_usage_available: true,
             source_cost_usd: Some(0.0),
             cost_authoritative: false,
             dedupe_confidence: "exact",

@@ -13,7 +13,7 @@ pub const VERSIONS: ParserVersions = ParserVersions {
     // Refresh analytics for archived workspace project grouping.
     identity: 2,
     index: 2,
-    usage: 0,
+    usage: 1,
 };
 
 pub fn sessions_root() -> PathBuf {
@@ -94,6 +94,125 @@ pub(crate) fn metadata_fingerprint(path: &Path) -> String {
         "{:x}",
         Sha256::digest(serde_json::to_vec(&metadata(path)).expect("metadata strings serialize"))
     )
+}
+
+pub(crate) fn parse_usage_file(path: &Path) -> Result<super::UsageParseOutput> {
+    let meta = metadata(path);
+    let session_id = meta.id.unwrap_or_else(|| {
+        path.parent()
+            .and_then(Path::file_name)
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    });
+    let mut output = super::UsageParseOutput::cacheable(Vec::new());
+    output
+        .deps
+        .push(super::UsageDependency::from_path_or_absent(
+            &path.with_file_name("session.json"),
+        ));
+    let mut reader = BufReader::new(std::fs::File::open(path)?);
+    let mut line = String::new();
+    let mut order = 0;
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        if !line.ends_with('\n') {
+            output.cacheable = false;
+            break;
+        }
+        order += 1;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(&line)?;
+        let payload = &value["payload"];
+        if payload["type"] != "usage_summary" {
+            continue;
+        }
+        let Some(summaries) = payload["promptTurnSummaries"]
+            .as_array()
+            .filter(|v| !v.is_empty())
+        else {
+            continue;
+        };
+        let mut credits = 0.0;
+        for summary in summaries {
+            anyhow::ensure!(
+                matches!(summary["unit"].as_str(), Some("credit" | "credits")),
+                "unsupported Kiro usage unit"
+            );
+            let amount = summary["usage"]
+                .as_f64()
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .ok_or_else(|| anyhow::anyhow!("invalid Kiro credit usage"))?;
+            credits += amount;
+            anyhow::ensure!(credits.is_finite(), "Kiro credit total overflow");
+        }
+        let timestamp_ms = value["timestamp"]
+            .as_str()
+            .and_then(super::common::parse_iso_millis)
+            .ok_or_else(|| anyhow::anyhow!("Kiro usage summary has no valid timestamp"))?;
+        let execution_id = string(payload, "executionId")
+            .or_else(|| string(&value, "id"))
+            .ok_or_else(|| anyhow::anyhow!("Kiro usage summary has no stable identity"))?;
+        output.events.push(crate::usage::UsageEvent {
+            source: "kiro",
+            source_path: path.to_string_lossy().as_ref().into(),
+            source_record_id: Some(execution_id),
+            session_id: Some(session_id.clone()),
+            request_id: None,
+            message_id: string(&value, "id"),
+            timestamp_ms,
+            project: meta.cwd.clone(),
+            provider: None,
+            model: None,
+            tokens: crate::usage::TokenBuckets::default(),
+            credits: Some(credits),
+            token_usage_available: false,
+            source_cost_usd: None,
+            cost_authoritative: false,
+            dedupe_confidence: "exact",
+            conservative_undercount: false,
+            cache_chain_excluded: true,
+            sidechain: meta.parent.is_some(),
+            permission_review: false,
+            source_order: order,
+        });
+    }
+    Ok(output)
+}
+
+pub(crate) fn reconcile_usage(events: &mut Vec<crate::usage::UsageEvent>) {
+    let mut latest = std::collections::HashMap::new();
+    for (index, event) in events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.source == "kiro")
+    {
+        let Some(id) = &event.source_record_id else {
+            continue;
+        };
+        let key = (event.session_id.clone(), id.clone());
+        let rank = (event.timestamp_ms, event.source_order, index);
+        let previous = latest.entry(key).or_insert(rank);
+        if rank > *previous {
+            *previous = rank;
+        }
+    }
+    let keep = latest
+        .into_values()
+        .map(|(_, _, index)| index)
+        .collect::<std::collections::HashSet<_>>();
+    let mut index = 0;
+    events.retain(|event| {
+        let retain =
+            event.source != "kiro" || event.source_record_id.is_none() || keep.contains(&index);
+        index += 1;
+        retain
+    });
 }
 
 fn source_content(payload: &Value) -> Result<Option<String>> {

@@ -433,6 +433,8 @@ function HomeActivityChart({
               ? "Activity unavailable"
               : loading || !currentPayload
                 ? "Loading activity…"
+                : metric === "tokens" && source === "kiro"
+                  ? "Token usage unavailable · Kiro reports credits"
                 : `${compactNumber.format(chart.total)} ${metric}${currentPayload.partial ? " · partial" : ""}`}
           </span>
           {chart.groups.length > 0 && (

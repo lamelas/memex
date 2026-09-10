@@ -959,5 +959,11 @@ Image and document attachments, including steering documents, are retained for
 the macOS reader and raw transcripts. Attachment-only messages are preserved;
 attachment contents are not extracted into searchable text. Snapshots,
 diagnostic logs, and other operational events are not indexed.
-This supports the sampled Kiro CLI JSONL format; usage reporting and launching
-Kiro to resume sessions are not supported yet.
+`memex usage --source kiro` reports credits from nonempty `usage_summary`
+events, separately from token and dollar totals. Repeated execution summaries
+and copied sessions within a machine are counted once. Empty summaries do not
+imply zero usage. Use `--format json --events` for per-execution credit details;
+`token_usage_available: false` marks records without token counts, and
+`unavailable_token_events` identifies incomplete token totals. Credit tracking
+uses the existing `token_usage = true` opt-in. Token counts and dollar costs are
+unavailable from this format. Launching Kiro to resume sessions is not supported.

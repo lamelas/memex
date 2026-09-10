@@ -597,6 +597,8 @@ fn grok_usage_event(
             output,
             reasoning,
         },
+        credits: None,
+        token_usage_available: true,
         source_cost_usd: usage
             .get("costUsdTicks")
             .and_then(Value::as_u64)

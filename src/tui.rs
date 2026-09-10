@@ -3412,6 +3412,9 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
                             ""
                         }
                     ),
+                    HomeChartMode::Tokens if app.source == SourceChoice::Kiro => {
+                        "Token usage unavailable · Kiro reports credits".into()
+                    }
                     HomeChartMode::Tokens => {
                         let total = activity_value_in_bounds(chart_activity, bounds);
                         format!(

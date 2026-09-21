@@ -50,6 +50,7 @@ use std::time::Duration;
 use std::time::Instant;
 use toml_edit::{DocumentMut, Item as TomlItem, value};
 
+mod daemon_upgrade;
 mod surface;
 use surface::{
     CliSearchMode, DaemonMcpArgs, DebugCommand, IndexCommand, IndexSource, OutputArgs,
@@ -62,7 +63,7 @@ static TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[command(
     name = "memex",
     version,
-    help_template = "{about-with-newline}\nUsage: {usage}\n\nFind and read:\n  search       Search history and memories\n  sessions     List sessions\n  projects     List project counts and activity\n  machines     List configured machines\n  session      Read a session or batch of pages\n  show         Read a record or memory\n  context      Read surrounding records\n\nBrowse and reuse:\n  tui          Browse interactively (also the default)\n  web          Serve or open the browser\n  share        Share a session\n  transfer     Transfer a session to another agent\n\nIndex and operate:\n  index        Index history and memories; rebuild, gc, embed, stats\n  daemon       Run indexing, web, and MCP together\n  usage        Report token usage and cost\n\nIntegrate and maintain:\n  mcp          Run the MCP server\n  skill        Manage the bundled search skill\n  update       Update Memex and installed skills\n  debug        Retrieval evaluation\n  help         Show command help\n\nOptions:\n{options}\n{after-help}",
+    help_template = "{about-with-newline}\nUsage: {usage}\n\nFind and read:\n  search       Search history and memories\n  sessions     List sessions\n  projects     List project counts and activity\n  activity     Chart conversation and token activity\n  machines     List configured machines\n  session      Read a session or batch of pages\n  show         Read a record or memory\n  context      Read surrounding records\n\nBrowse and reuse:\n  tui          Browse interactively (also the default)\n  web          Serve or open the browser\n  share        Share a session\n  transfer     Transfer a session to another agent\n\nIndex and operate:\n  index        Index history and memories; rebuild, gc, embed, stats\n  daemon       Run indexing, web, and MCP together\n  usage        Report token usage and cost\n\nIntegrate and maintain:\n  mcp          Run the MCP server\n  skill        Manage the bundled search skill\n  update       Update Memex and installed skills\n  debug        Retrieval evaluation\n  help         Show command help\n\nOptions:\n{options}\n{after-help}",
     about = "Search, browse, and reuse local agent history and memory",
     after_help = "\
 QUICK START:
@@ -177,6 +178,18 @@ struct IndexArgs {
     /// Skip indexing Kiro CLI sessions
     #[arg(long = "no-kiro", default_value_t = false, hide = true)]
     no_kiro: bool,
+    /// Index IBM Bob tasks from ~/.bob/db/bob.db [default: true]
+    #[arg(long, default_value_t = true, hide = true)]
+    bob: bool,
+    /// Skip indexing IBM Bob tasks
+    #[arg(long = "no-bob", default_value_t = false, hide = true)]
+    no_bob: bool,
+    /// Index ZCode sessions from ~/.zcode/cli/db/db.sqlite [default: true]
+    #[arg(long, default_value_t = true, hide = true)]
+    zcode: bool,
+    /// Skip indexing ZCode sessions
+    #[arg(long = "no-zcode", default_value_t = false, hide = true)]
+    no_zcode: bool,
     /// Generate embeddings for semantic search during indexing
     #[arg(long, help_heading = "Embeddings")]
     embeddings: bool,
@@ -245,6 +258,13 @@ EXAMPLES:
     Reindex {
         #[command(flatten)]
         index: IndexArgs,
+    },
+    /// Merge segments below 5% of the corpus, excluding the three largest
+    #[command(hide = true)]
+    IndexCompact {
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
     },
     /// Reclaim unreachable immutable index generations without rebuilding
     #[command(hide = true)]
@@ -579,6 +599,36 @@ The input contains at most 32 requests; each page is limited to 500 records."
     /// List this machine and enabled configured peers (without connecting)
     Machines {
         /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// Aggregate conversation or token activity over time
+    Activity {
+        #[arg(long, default_value = "sessions", value_parser = ["sessions", "tokens"])]
+        metric: String,
+        #[arg(long, default_value = "30d", value_parser = ["24h", "7d", "30d", "all"])]
+        range: String,
+        #[arg(long, default_value = "local")]
+        machine: String,
+        /// Return uncompressed time buckets for one machine
+        #[arg(long)]
+        raw: bool,
+        /// Emit advancing usage-cache progress on stderr
+        #[arg(long, hide = true)]
+        progress: bool,
+        /// Common clock for native requests across several machines
+        #[arg(long, hide = true, requires = "raw")]
+        now_ms: Option<u64>,
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long)]
+        source: Option<SourceFilter>,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, value_enum, default_value_t = SessionOrigin::Regular)]
+        origin: SessionOrigin,
         #[arg(long)]
         root: Option<PathBuf>,
         #[command(flatten)]
@@ -1108,6 +1158,11 @@ impl From<SessionOrigin> for crate::analytics::SessionKindFilter {
 
 #[derive(Subcommand)]
 enum IndexServiceCommand {
+    /// Activate an installed update for an already enabled Memex-owned daemon
+    Reconcile {
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
     /// Run the configured daemon in the foreground
     Run {
         #[command(flatten)]
@@ -1252,6 +1307,7 @@ enum IndexServiceCommand {
 }
 
 pub fn run() -> Result<()> {
+    crate::profiling::span!("cli.run");
     let cli = Cli::parse();
     let interactive = interaction_allowed(
         cli.non_interactive,
@@ -1335,11 +1391,14 @@ pub fn run() -> Result<()> {
             } else if web_ui || web_listen.is_some() || mcp || no_mcp || mcp_listen.is_some() {
                 return Err(anyhow!("server options require `memex daemon run`"));
             } else {
-                run_index_args(&index, false, false)?;
+                run_index_args(&index, false)?;
             }
         }
         Commands::Reindex { index } => {
-            run_index_args(&index, true, false)?;
+            run_index_args(&index, true)?;
+        }
+        Commands::IndexCompact { root } => {
+            run_index_compact(root)?;
         }
         Commands::IndexGc {
             root,
@@ -1445,6 +1504,7 @@ pub fn run() -> Result<()> {
             crate::web::serve(root, &listen)?;
         }
         Commands::IndexService { action } => match action {
+            IndexServiceCommand::Reconcile { root } => daemon_upgrade::reconcile(root)?,
             IndexServiceCommand::Run {
                 index,
                 web_ui,
@@ -1691,6 +1751,63 @@ pub fn run() -> Result<()> {
                 .resolve(OutputFormat::Jsonl, None, false)?
                 .print_values(crate::machine::configured_machine_summaries(&config)?)?;
         }
+        Commands::Activity {
+            metric,
+            range,
+            machine,
+            query,
+            raw,
+            progress,
+            now_ms,
+            source,
+            project,
+            origin,
+            root,
+            output,
+        } => {
+            let paths = Paths::new(root)?;
+            let request = crate::web::ActivityRequest {
+                metric: if metric == "tokens" {
+                    crate::web::ActivityMetric::Tokens
+                } else {
+                    crate::web::ActivityMetric::Sessions
+                },
+                range: Some(crate::web::TimeRange::parse(&range)?),
+                query: query.unwrap_or_default().trim().to_owned(),
+                source,
+                project,
+                origin: origin.into(),
+                days: 30,
+            };
+            let collect = || -> Result<Value> {
+                Ok(if raw {
+                    let now = now_ms
+                        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis().max(0) as u64);
+                    serde_json::to_value(crate::web::single_machine_activity_payload(
+                        &paths, &request, &machine, now,
+                    )?)?
+                } else {
+                    serde_json::to_value(crate::web::machine_activity_payload(
+                        &paths, &request, &machine,
+                    )?)?
+                })
+            };
+            let payload = if progress {
+                crate::usage::with_usage_progress(collect, |progress| {
+                    writeln!(
+                        std::io::stderr(),
+                        "MEMEX_PROGRESS {}",
+                        serde_json::to_string(&progress)?
+                    )?;
+                    Ok(())
+                })??
+            } else {
+                collect()?
+            };
+            output
+                .resolve(OutputFormat::Json, None, false)?
+                .print_value(&payload)?;
+        }
         Commands::Projects {
             source,
             machine,
@@ -1926,6 +2043,9 @@ fn run_index_loop(
 ) -> Result<()> {
     // Keep the native listener alive for every daemon watch mode, including
     // the default event loop, and release it when that loop exits or fails.
+    let paths = Paths::new(index.root.clone())?;
+    let mut runtime = crate::daemon_runtime::DaemonRuntime::start(&paths)?;
+    let mut upgrade = daemon_upgrade::Replacement::new()?;
     #[cfg(unix)]
     let _native_server = match crate::native::spawn(index.root.clone()) {
         Ok(server) => Some(server),
@@ -1935,9 +2055,23 @@ fn run_index_loop(
         }
     };
     if mode == WatchMode::Poll {
-        run_poll_loop(index, interval_secs, web_listen, mcp)
+        run_poll_loop(
+            index,
+            interval_secs,
+            web_listen,
+            mcp,
+            &mut runtime,
+            &mut upgrade,
+        )
     } else {
-        run_event_loop(index, Duration::from_secs(interval_secs), web_listen, mcp)
+        run_event_loop(
+            index,
+            Duration::from_secs(interval_secs),
+            web_listen,
+            mcp,
+            &mut runtime,
+            &mut upgrade,
+        )
     }
 }
 
@@ -1946,12 +2080,14 @@ fn run_poll_loop(
     interval_secs: u64,
     web_listen: Option<String>,
     mcp: Option<crate::mcp::HttpOptions>,
+    runtime: &mut crate::daemon_runtime::DaemonRuntime,
+    upgrade: &mut daemon_upgrade::Replacement,
 ) -> Result<()> {
     let mcp_server = mcp
         .map(|options| crate::mcp::spawn_http(index.root.clone(), options))
         .transpose()?;
     let _web_thread = initialize_index_loop(
-        || run_index_args(index, false, true),
+        || run_index_args(index, false),
         || {
             web_listen
                 .as_deref()
@@ -1959,15 +2095,23 @@ fn run_poll_loop(
                 .transpose()
         },
     )?;
+    runtime.mark_ready()?;
     loop {
-        if let Some(server) = &mcp_server {
-            if !server.wait_timeout(Duration::from_secs(interval_secs))? {
-                return Ok(());
+        let deadline = Instant::now() + Duration::from_secs(interval_secs);
+        while Instant::now() < deadline {
+            upgrade.check();
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(1));
+            if let Some(server) = &mcp_server {
+                if !server.wait_timeout(remaining)? {
+                    return Ok(());
+                }
+            } else {
+                std::thread::sleep(remaining);
             }
-        } else {
-            std::thread::sleep(Duration::from_secs(interval_secs));
         }
-        run_index_args(index, false, true)?;
+        run_index_args(index, false)?;
         std::io::stdout().flush().ok();
     }
 }
@@ -1990,6 +2134,8 @@ fn run_event_loop(
     resync: Duration,
     web_listen: Option<String>,
     mcp: Option<crate::mcp::HttpOptions>,
+    runtime: &mut crate::daemon_runtime::DaemonRuntime,
+    upgrade: &mut daemon_upgrade::Replacement,
 ) -> Result<()> {
     use crate::watch::{
         FireCause, HOT_SWEEP_INTERVAL, HOT_WINDOW, WatchConfig, WatchService, dirty_needs_ingest,
@@ -2018,7 +2164,7 @@ fn run_event_loop(
         .map(|options| crate::mcp::spawn_http(index.root.clone(), options))
         .transpose()?;
     let _web_thread = initialize_index_loop(
-        || run_index_args(index, false, true),
+        || run_index_args(index, false),
         || {
             web_listen
                 .as_deref()
@@ -2027,15 +2173,17 @@ fn run_event_loop(
         },
     )?;
 
+    runtime.mark_ready()?;
     service.mark_complete(FireCause::Resync);
     let mut last_sweep = Instant::now();
     loop {
+        upgrade.check();
         match service.poll() {
             Some(FireCause::Resync) => {
                 if let Err(error) = refresh_watch_roots(&mut service, index) {
                     eprintln!("watch: root refresh failed: {error:#}");
                 }
-                match run_index_args(index, false, true) {
+                match run_index_args(index, false) {
                     Ok(()) => {
                         service.mark_complete(FireCause::Resync);
                         log_watch_stats(&service);
@@ -2047,7 +2195,7 @@ fn run_event_loop(
                 let dirty = service.dirty_paths();
                 match dirty_needs_ingest(&paths, &dirty) {
                     Ok(false) => service.mark_skipped(),
-                    Ok(true) => match run_index_selection(index, false, true, Some(&dirty)) {
+                    Ok(true) => match run_index_selection(index, false, Some(&dirty)) {
                         Ok(full_scan) => {
                             if full_scan
                                 && let Err(error) = refresh_watch_roots(&mut service, index)
@@ -2067,7 +2215,7 @@ fn run_event_loop(
                     },
                     Err(error) => {
                         eprintln!("watch: dirty check failed, ingesting to be safe: {error:#}");
-                        if run_index_args(index, false, true).is_ok() {
+                        if run_index_args(index, false).is_ok() {
                             service.mark_complete(FireCause::Resync);
                             log_watch_stats(&service);
                         }
@@ -2123,8 +2271,8 @@ fn log_watch_stats(service: &WatchService) {
         stats.hot_hits,
     );
 }
-fn run_index_args(index: &IndexArgs, reindex: bool, continuous: bool) -> Result<()> {
-    run_index(index, reindex, continuous)
+fn run_index_args(index: &IndexArgs, reindex: bool) -> Result<()> {
+    run_index(index, reindex)
 }
 
 /// Resolve the ingest projection from CLI flags plus config. Shared by the
@@ -2169,6 +2317,8 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         include_jcode: index.source_enabled(IndexSource::Jcode),
         include_muse: index.source_enabled(IndexSource::Muse),
         include_antigravity: index.source_enabled(IndexSource::Antigravity),
+        include_bob: index.source_enabled(IndexSource::Bob),
+        include_zcode: index.source_enabled(IndexSource::Zcode),
         include_kiro: index.source_enabled(IndexSource::Kiro),
         exclude_patterns: excludes,
         embeddings,
@@ -2176,11 +2326,12 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         model: model_choice,
         embed_runtime,
         tool_content_limits,
+        defer_merges: false,
     })
 }
 
-fn run_index(index: &IndexArgs, reindex: bool, continuous: bool) -> Result<()> {
-    run_index_selection(index, reindex, continuous, None).map(|_| ())
+fn run_index(index: &IndexArgs, reindex: bool) -> Result<()> {
+    run_index_selection(index, reindex, None).map(|_| ())
 }
 
 /// Return whether discovery covered all sources, so only reconciliation
@@ -2188,7 +2339,6 @@ fn run_index(index: &IndexArgs, reindex: bool, continuous: bool) -> Result<()> {
 fn run_index_selection(
     index: &IndexArgs,
     reindex: bool,
-    continuous: bool,
     dirty: Option<&HashSet<PathBuf>>,
 ) -> Result<bool> {
     let paths = Paths::new(index.root.clone())?;
@@ -2198,13 +2348,17 @@ fn run_index_selection(
     let operation = if reindex { "reindex" } else { "index" };
     let lease = IngestLease::acquire(&paths, operation, INGEST_LEASE_TIMEOUT)?;
     if reindex {
-        reset_reindex_artifacts(&paths)?;
+        ensure_rebuild_space(&paths)?;
+        reset_reindex_artifacts(&paths, &lease)?;
     }
     paths.ensure_dirs()?;
-    let index = if continuous {
-        SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?
+    let index = if reindex {
+        SearchIndex::open_or_create_for_rebuild(&paths.index)?
     } else {
-        SearchIndex::open_or_create_for_ingest(&paths.index)?
+        match SearchIndex::open_or_create(&paths.index) {
+            Ok(index) if !index.is_writable() => index,
+            _ => SearchIndex::open_or_create_for_search_refresh(&paths.index)?,
+        }
     };
 
     let (report, full_scan) = if let Some(dirty) = dirty {
@@ -2227,24 +2381,74 @@ fn run_index_selection(
             report.records_added, report.files_scanned, report.files_skipped
         );
     }
+    for path in &report.diagnostics.unreadable_sources {
+        eprintln!("warning: skipped unreadable source {path}; its indexed records are kept");
+    }
     if print_diagnostics && !report.diagnostics.is_empty() {
         println!(
             "parser diagnostics:\n{}",
             serde_json::to_string_pretty(&report.diagnostics)?
         );
     }
+    drop(lease);
+    if report.records_added > 0 {
+        crate::machine::schedule_compaction_if_fragmented(&paths)?;
+    }
     Ok(full_scan)
 }
 
-fn reset_reindex_artifacts(paths: &Paths) -> Result<()> {
+/// A rebuild removes the current index before writing the new one, so running out of space
+/// half-way leaves nothing to search. The new index is at most about the size of the old one.
+fn ensure_rebuild_space(paths: &Paths) -> Result<()> {
+    let needed = unique_file_bytes(&paths.index)?;
+    let available = available_bytes(&paths.root)?;
+    if available < needed {
+        anyhow::bail!(
+            "rebuild needs about {} MiB free on {} but only {} MiB is available; free space \
+             before rebuilding, the current index is untouched",
+            needed >> 20,
+            paths.root.display(),
+            available >> 20
+        );
+    }
+    Ok(())
+}
+
+/// Bytes on disk below `dir`, counting each inode once so hard-linked segment files are not
+/// multiplied by their link count.
+fn unique_file_bytes(dir: &Path) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let mut seen = HashSet::new();
+    let mut total = 0;
+    for entry in walkdir::WalkDir::new(dir).into_iter().flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_file() && seen.insert((metadata.dev(), metadata.ino())) {
+            total += metadata.len();
+        }
+    }
+    Ok(total)
+}
+
+fn available_bytes(path: &Path) -> Result<u64> {
+    let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .context("data directory path contains a NUL byte")?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("statvfs data directory");
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.f_bavail as u128 * stat.f_frsize as u128) as u64)
+}
+
+fn reset_reindex_artifacts(paths: &Paths, lease: &IngestLease) -> Result<()> {
+    crate::state::checkpoint::reset(&paths.state.join("ingest.json"), lease)?;
     remove_generated_path(&paths.index)?;
     remove_generated_path(&paths.vectors)?;
     remove_generated_path(&paths.root.join("memory"))?;
 
     for name in [
-        "ingest.json",
-        "ingest.pending.json",
-        "scan_cache.json",
         "analytics.sqlite",
         "analytics.sqlite-wal",
         "analytics.sqlite-shm",
@@ -2281,6 +2485,53 @@ fn remove_generated_path(path: &Path) -> Result<()> {
     result.with_context(|| format!("remove reindex artifact {}", path.display()))
 }
 
+/// Search refreshes append without merging; this folds the accumulated small segments into
+/// one while leaving the largest untouched, so a compaction costs the small segments' size,
+/// not the corpus's.
+///
+/// The ingest lease is held only to stage from the current generation and to publish; the
+/// merge itself runs unleased so search refreshes never wait on it. Publication is skipped
+/// when another writer published in between, leaving the next compaction to fold again.
+fn run_index_compact(root: Option<PathBuf>) -> Result<()> {
+    let paths = Paths::new(root)?;
+    if !SearchIndex::exists(&paths.index) {
+        println!("no index to compact");
+        return Ok(());
+    }
+    let Some(_compaction) = crate::lease::CompactionLock::try_acquire(&paths)? else {
+        println!("compaction already running");
+        return Ok(());
+    };
+    let (index, base) = {
+        let _lease = IngestLease::acquire(&paths, "compaction", INGEST_LEASE_TIMEOUT)?;
+        let base = SearchIndex::open_or_create(&paths.index)?
+            .snapshot_version()
+            .to_string();
+        (SearchIndex::open_or_create_for_ingest(&paths.index)?, base)
+    };
+    let merged = index.compact_small_segments(crate::index::COMPACTION_RETAINED_SEGMENTS)?;
+    if merged > 0 {
+        let _lease = IngestLease::acquire(&paths, "compaction", INGEST_LEASE_TIMEOUT)?;
+        let current = SearchIndex::open_or_create(&paths.index)?
+            .snapshot_version()
+            .to_string();
+        if current != base {
+            println!("compaction skipped: the index moved while merging");
+            crate::machine::note_compaction_pending(&paths)?;
+            return Ok(());
+        }
+        index.publish_generation()?;
+        crate::machine::clear_compaction_pending(&paths)?;
+    } else {
+        crate::machine::clear_compaction_pending(&paths)?;
+    }
+    println!(
+        "compacted {merged} segments; {} remain",
+        SearchIndex::open_or_create(&paths.index)?.segment_count()?
+    );
+    Ok(())
+}
+
 fn run_index_gc(root: Option<PathBuf>, dry_run: bool, offline: bool) -> Result<()> {
     if !dry_run && !offline {
         return Err(anyhow!(
@@ -2294,18 +2545,20 @@ fn run_index_gc(root: Option<PathBuf>, dry_run: bool, offline: bool) -> Result<(
     let memory_generations = gc_memory_vectors(&paths, dry_run)?;
     if report.dry_run {
         println!(
-            "would remove {} unreachable generations, {} abandoned generation work directories, {} legacy index files, and {} obsolete memory vector generations; no rebuild required",
+            "would remove {} unreachable generations, {} abandoned generation work directories, {} legacy index files, {} unreferenced shared segment files, and {} obsolete memory vector generations; no rebuild required",
             report.generations_removed,
             report.abandoned_workdirs_removed,
             report.legacy_files_removed,
+            report.shared_files_removed,
             memory_generations
         );
     } else {
         println!(
-            "removed {} unreachable generations, {} abandoned generation work directories, {} legacy index files, and {} obsolete memory vector generations; retained the committed indexes without rebuilding",
+            "removed {} unreachable generations, {} abandoned generation work directories, {} legacy index files, {} unreferenced shared segment files, and {} obsolete memory vector generations; retained the committed indexes without rebuilding",
             report.generations_removed,
             report.abandoned_workdirs_removed,
             report.legacy_files_removed,
+            report.shared_files_removed,
             memory_generations
         );
     }
@@ -2403,7 +2656,7 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
     let memory_embedded = embed_memory(&paths, model_choice, &embed_runtime)?;
     progress.finish();
     println!(
-        "embedded {} conversation vectors and {} memory section vectors (claude {}, codex {}, opencode {}, cursor {}, pi {}, openclaw {}, copilot {}, jcode {}, muse {}, grok {}, kiro {})",
+        "embedded {} conversation vectors and {} memory section vectors (claude {}, codex {}, opencode {}, cursor {}, pi {}, openclaw {}, copilot {}, jcode {}, muse {}, grok {}, bob {}, zcode {}, kiro {})",
         embedded_total,
         memory_embedded,
         embedded_counts[crate::types::SourceKind::Claude.idx()],
@@ -2416,6 +2669,8 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
         embedded_counts[crate::types::SourceKind::Jcode.idx()],
         embedded_counts[crate::types::SourceKind::Muse.idx()],
         embedded_counts[crate::types::SourceKind::Grok.idx()],
+        embedded_counts[crate::types::SourceKind::Bob.idx()],
+        embedded_counts[crate::types::SourceKind::Zcode.idx()],
         embedded_counts[crate::types::SourceKind::Kiro.idx()],
     );
 
@@ -2456,6 +2711,7 @@ fn run_search(
     machines: Vec<String>,
     trace: bool,
 ) -> Result<()> {
+    crate::profiling::span!("cli.search");
     let format = if json_array && !verbose {
         SearchFormat::Json
     } else {
@@ -2970,6 +3226,34 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
         Operation::Machines {} => Ok(Value::Array(crate::machine::configured_machine_summaries(
             &config,
         )?)),
+        Operation::Activity {
+            machine,
+            metric,
+            range,
+            query,
+            project,
+            source,
+            origin,
+            now_ms,
+        } => {
+            let metric = match metric.as_str() {
+                "sessions" => crate::web::ActivityMetric::Sessions,
+                "tokens" => crate::web::ActivityMetric::Tokens,
+                _ => anyhow::bail!("unknown activity metric: {metric}"),
+            };
+            let request = crate::web::ActivityRequest {
+                metric,
+                range: Some(crate::web::TimeRange::parse(&range)?),
+                query: query.unwrap_or_default().trim().to_owned(),
+                project,
+                source: parse_source_filter(source)?,
+                origin: origin.into(),
+                days: 30,
+            };
+            Ok(serde_json::to_value(
+                crate::web::single_machine_activity_payload(paths, &request, &machine, now_ms)?,
+            )?)
+        }
         Operation::Projects { machine } => {
             check_analytics(&machine)?;
             let items = if machine == crate::machine::LOCAL_MACHINE_ID {
@@ -3055,7 +3339,7 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
                     unique_session: true,
                     fields: search_fields(
                         Some(
-                            "source,session_id,source_path,project,snippet,ts,machine,record_id"
+                            "source,session_id,source_path,project,snippet,ts,machine,record_id,conversation_kind"
                                 .into(),
                         ),
                         false,
@@ -3213,6 +3497,8 @@ fn collect_search_with_auto_index(
         top_n_per_session
     };
     let kind_filter: crate::analytics::SessionKindFilter = origin.into();
+    // `--full` clears the field set and asks for whole records; everything else renders excerpts.
+    let text_limit = fields.as_ref().map(|_| crate::machine::SEARCH_TEXT_BUDGET);
     let render = RenderOptions {
         verbose,
         pretty: false,
@@ -3270,6 +3556,7 @@ fn collect_search_with_auto_index(
                 recency_half_life_days,
                 min_score,
                 project_grouping: None,
+                text_limit,
             };
             let federated = federated_search(
                 &paths,
@@ -5570,9 +5857,21 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
         crate::types::SourceKind::Jcode => "jcode",
         crate::types::SourceKind::Muse => "muse",
         crate::types::SourceKind::Antigravity => "antigravity",
+        crate::types::SourceKind::Bob => "bob",
+        crate::types::SourceKind::Zcode => "zcode",
         crate::types::SourceKind::Kiro => "kiro",
     };
     let source_path = &record.source_path;
+    if record.source == crate::types::SourceKind::Bob {
+        return Err(anyhow!(
+            "sharing is not supported for Bob tasks: {source_path} is a database entry, not a transcript file"
+        ));
+    }
+    if record.source == crate::types::SourceKind::Zcode {
+        return Err(anyhow!(
+            "sharing is not supported for ZCode sessions: {source_path} is a database, not a transcript file"
+        ));
+    }
 
     // Build agentexport command
     let mut cmd = std::process::Command::new("agentexport");
@@ -5721,6 +6020,7 @@ fn run_index_service_enable(
 
     let paths = Paths::new(index.root.clone())?;
     let config = UserConfig::load(&paths)?;
+    daemon_upgrade::ensure_mutable(&paths.root.join("config.toml"))?;
     let mcp = mcp_args.resolve(&config);
     let mcp_listen = mcp.as_ref().map(|options| options.listen);
     let cli_web_ui = web_ui || web_listen.is_some();
@@ -5757,7 +6057,7 @@ fn run_index_service_enable(
         crate::web::validate_listener(&web_listen)?;
     }
 
-    let exe = std::env::current_exe()?;
+    let exe = daemon_upgrade::service_executable()?;
     let program_args = build_index_command_args(
         index,
         continuous,
@@ -5803,6 +6103,9 @@ fn run_index_service_enable(
     result?;
     persist_index_service_config(&paths, &config_updates)?;
     disable_auto_index_on_search_by_default(&paths, &config)?;
+    if continuous {
+        daemon_upgrade::wait_ready(&paths, Duration::from_secs(30))?;
+    }
     if web_ui {
         wait_for_web_ui(&web_listen, Duration::from_secs(5))?;
         println!("web UI: running on {web_listen}");
@@ -6041,6 +6344,12 @@ fn run_index_service_enable_launchd(
         .or_else(|| config.index_service_plist.clone())
         .unwrap_or(default_plist);
     validate_service_label(&label)?;
+    daemon_upgrade::ensure_mutable(&plist_path)?;
+
+    let (domain_target, service_target) = launchctl_targets(&label)?;
+    if launchctl_service_exists(&service_target)? {
+        verify_launchd_job_loaded(&service_target, &plist_path)?;
+    }
 
     if let Some(parent) = plist_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -6068,8 +6377,6 @@ fn run_index_service_enable_launchd(
     std::fs::write(&plist_path, contents)?;
 
     println!("wrote launchd plist: {}", plist_path.display());
-    let (domain_target, service_target) = launchctl_targets(&label)?;
-
     // Replace any existing job with the same label to avoid stale launchd state.
     let _ = launchctl_bootout_service(&service_target)?;
 
@@ -6136,6 +6443,10 @@ fn run_index_service_enable_systemd(
 
     let service_path = systemd_dir.join(format!("{}.service", label));
     let timer_path = systemd_dir.join(format!("{}.timer", label));
+    daemon_upgrade::ensure_mutable(&service_path)?;
+    daemon_upgrade::ensure_mutable(&timer_path)?;
+    daemon_upgrade::ensure_systemd_owner(&label, &service_path)?;
+    daemon_upgrade::ensure_systemd_owner(&label, &timer_path)?;
     let existing_mode = registered_systemd_mode(&service_path, &timer_path)?;
     if let Some(counterpart) =
         systemd_counterpart_unit(&label, continuous, existing_mode, timer_path.exists())
@@ -6212,7 +6523,7 @@ fn run_index_service_status(
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
 
-    if cfg!(target_os = "macos") {
+    let result = if cfg!(target_os = "macos") {
         run_index_service_status_launchd(&config, &paths, label, plist)
     } else if cfg!(target_os = "linux") {
         run_index_service_status_systemd(&config, label, systemd_dir)
@@ -6220,7 +6531,9 @@ fn run_index_service_status(
         Err(anyhow!(
             "background service scheduling is only supported on macOS and Linux"
         ))
-    }
+    };
+    result?;
+    daemon_upgrade::print_runtime(&paths)
 }
 
 fn run_index_service_open(
@@ -6630,7 +6943,11 @@ fn run_index_service_disable_launchd(
         .or_else(|| config.index_service_plist.clone())
         .unwrap_or(default_plist);
     validate_service_label(&label)?;
+    daemon_upgrade::ensure_mutable(&plist_path)?;
     let (_domain_target, service_target) = launchctl_targets(&label)?;
+    if launchctl_service_exists(&service_target)? {
+        verify_launchd_job_loaded(&service_target, &plist_path)?;
+    }
     let _ = launchctl_bootout_service(&service_target)?;
 
     if plist_path.exists() {
@@ -6719,7 +7036,7 @@ fn verify_launchd_job_loaded(service_target: &str, plist_path: &std::path::Path)
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let expected_path = plist_path.to_string_lossy();
-    if !stdout.contains(&format!("path = {expected_path}")) {
+    if service_output_value(&stdout, "path") != Some(expected_path.as_ref()) {
         return Err(anyhow!(
             "launchd job state mismatch; expected path {}, launchctl output did not match",
             plist_path.display()
@@ -6762,6 +7079,10 @@ fn run_index_service_disable_systemd(
 
     let service_path = systemd_dir.join(format!("{}.service", label));
     let timer_path = systemd_dir.join(format!("{}.timer", label));
+    daemon_upgrade::ensure_mutable(&service_path)?;
+    daemon_upgrade::ensure_mutable(&timer_path)?;
+    daemon_upgrade::ensure_systemd_owner(&label, &service_path)?;
+    daemon_upgrade::ensure_systemd_owner(&label, &timer_path)?;
 
     // Stop and disable timer if it exists
     if timer_path.exists() {
@@ -6879,6 +7200,12 @@ fn build_index_command_args(
     if !index.muse || index.no_muse {
         args.push("--no-muse".to_string());
     }
+    if !index.bob || index.no_bob {
+        args.push("--no-bob".to_string());
+    }
+    if !index.zcode || index.no_zcode {
+        args.push("--no-zcode".to_string());
+    }
     if let Some(listen) = mcp_listen {
         args.push("--mcp".to_string());
         args.push("--mcp-listen".to_string());
@@ -6955,6 +7282,9 @@ fn build_launchd_plist(
     if keep_alive {
         out.push_str("  <key>KeepAlive</key>\n");
         out.push_str("  <true/>\n");
+        // Continuous indexing also serves the native app socket. Its ordinary
+        // Unix-socket requests cannot trigger Adaptive's XPC promotion.
+        out.push_str("  <key>ProcessType</key>\n  <string>Interactive</string>\n");
     }
 
     if let Some(stdout) = stdout {
@@ -7364,7 +7694,7 @@ fn format_ts(ts: u64) -> String {
     dt.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-pub(crate) fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
+pub(crate) fn query_literals(query: &str) -> Vec<String> {
     use tantivy::query_grammar::{Occur, UserInputAst, UserInputLeaf};
     fn literals(ast: &UserInputAst, terms: &mut Vec<String>) {
         match ast {
@@ -7403,13 +7733,20 @@ pub(crate) fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
         if term.is_empty() || !seen.insert(term.clone()) {
             continue;
         }
-        out.push(
-            RegexBuilder::new(&regex::escape(&term))
-                .case_insensitive(true)
-                .build()?,
-        );
+        out.push(term);
     }
-    Ok(out)
+    out
+}
+
+pub(crate) fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
+    query_literals(query)
+        .into_iter()
+        .map(|term| {
+            Ok(RegexBuilder::new(&regex::escape(&term))
+                .case_insensitive(true)
+                .build()?)
+        })
+        .collect()
 }
 
 // Preview the earliest literal hit; semantic-only hits fall back to a compact prefix.
@@ -7572,6 +7909,19 @@ fn refresh_installed_skills(binary: &Path) -> Result<()> {
     Ok(())
 }
 
+fn activate_installed_daemon(binary: &Path) -> Result<()> {
+    let status = std::process::Command::new(binary)
+        .args(["--no-update-check", "daemon", "reconcile"])
+        .stdin(std::process::Stdio::null())
+        .status()
+        .with_context(|| format!("activate daemon using {}", binary.display()))?;
+    anyhow::ensure!(
+        status.success(),
+        "memex is installed, but daemon activation failed ({status}); run `memex daemon reconcile` to retry"
+    );
+    Ok(())
+}
+
 fn update_homebrew(brew: &Path, expected_version: Option<&str>) -> Result<PathBuf> {
     for args in [vec!["update"], vec!["upgrade", HOMEBREW_FORMULA]] {
         let status = std::process::Command::new(brew)
@@ -7623,6 +7973,7 @@ fn update_homebrew(brew: &Path, expected_version: Option<&str>) -> Result<PathBu
         .filter(|value| parse_version_parts(value).is_some())
         .ok_or_else(|| anyhow!("unexpected installed memex version: {version}"))?;
     println!("Installed {version}");
+    activate_installed_daemon(&binary)?;
     refresh_installed_skills(&binary)?;
     if expected_version.is_some_and(|latest| is_newer_version(installed_version, latest)) {
         return Err(anyhow!(
@@ -7657,6 +8008,7 @@ fn update_release(current_exe: &Path, latest: &str) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     if !is_newer_version(current, latest) {
         println!("memex is already up to date (v{current}); refreshing installed skills");
+        activate_installed_daemon(current_exe)?;
         return refresh_installed_skills(current_exe);
     }
     let (os, arch) = detect_platform()?;
@@ -7692,13 +8044,23 @@ fn update_release(current_exe: &Path, latest: &str) -> Result<()> {
     if !status.success() {
         return Err(anyhow!("Failed to extract release"));
     }
-    replace_binary(&tmp_dir.path().join("memex"), current_exe)?;
+    let downloaded = tmp_dir.path().join("memex");
+    anyhow::ensure!(
+        daemon_upgrade::verify_binary(&downloaded)? == latest,
+        "downloaded memex does not match requested release {latest}"
+    );
+    replace_binary(&downloaded, current_exe)?;
     println!("Updated memex to v{latest}");
+    activate_installed_daemon(current_exe)?;
     refresh_installed_skills(current_exe)
 }
 
 fn perform_update(known_latest: Option<&str>) -> Result<()> {
     let current_exe = std::env::current_exe()?.canonicalize()?;
+    anyhow::ensure!(
+        !daemon_upgrade::nix_store(&current_exe),
+        "Nix manages this installation. Update the flake/profile and activate your NixOS or Home Manager configuration; memex update cannot replace an immutable Nix store binary. For a profile-owned daemon, run `memex daemon reconcile` after upgrading the profile."
+    );
     if homebrew_executable(&current_exe) {
         let brew = find_in_path("brew").ok_or_else(|| {
             anyhow!("Homebrew manages this installation, but brew is not on PATH")
@@ -7868,6 +8230,38 @@ mod tests {
     use crate::test_support::{EnvVarGuard, env_lock};
     use crate::vector::VectorIndex;
     use tempfile::TempDir;
+
+    #[test]
+    fn activity_cli_validates_ranges_metrics_and_filter_arguments() {
+        for range in ["24h", "7d", "30d", "all"] {
+            for metric in ["sessions", "tokens"] {
+                assert!(
+                    Cli::try_parse_from([
+                        "memex",
+                        "activity",
+                        "--range",
+                        range,
+                        "--metric",
+                        metric,
+                        "--machine",
+                        "all",
+                        "--query=--needle",
+                        "--project",
+                        "memex",
+                        "--source",
+                        "codex",
+                        "--origin",
+                        "regular",
+                        "--format",
+                        "json"
+                    ])
+                    .is_ok()
+                );
+            }
+        }
+        assert!(Cli::try_parse_from(["memex", "activity", "--range", "year"]).is_err());
+        assert!(Cli::try_parse_from(["memex", "activity", "--metric", "cost"]).is_err());
+    }
 
     #[test]
     fn session_count_query_requires_count_and_rejects_cwd() {
@@ -8228,7 +8622,7 @@ mod tests {
             jcode: false,
             muse: false,
             antigravity: false,
-            kiro: false,
+            bob: false,
             no_codex: false,
             no_opencode: false,
             no_pi: false,
@@ -8239,6 +8633,10 @@ mod tests {
             no_jcode: false,
             no_muse: false,
             no_antigravity: false,
+            no_bob: false,
+            zcode: false,
+            no_zcode: false,
+            kiro: false,
             no_kiro: false,
             embeddings: false,
             no_embeddings: false,
@@ -8267,6 +8665,7 @@ mod tests {
         assert!(args.contains(&"--no-grok".to_string()));
         assert!(args.contains(&"--no-jcode".to_string()));
         assert!(args.contains(&"--no-muse".to_string()));
+        assert!(args.contains(&"--no-bob".to_string()));
     }
 
     #[test]
@@ -8289,7 +8688,7 @@ mod tests {
             jcode: true,
             muse: true,
             antigravity: true,
-            kiro: true,
+            bob: true,
             no_codex: false,
             no_opencode: false,
             no_pi: false,
@@ -8300,6 +8699,10 @@ mod tests {
             no_jcode: false,
             no_muse: false,
             no_antigravity: false,
+            no_bob: false,
+            zcode: false,
+            no_zcode: false,
+            kiro: true,
             no_kiro: false,
             embeddings: false,
             no_embeddings: false,
@@ -8344,7 +8747,7 @@ mod tests {
             jcode: true,
             muse: true,
             antigravity: true,
-            kiro: true,
+            bob: true,
             no_codex: false,
             no_opencode: false,
             no_pi: false,
@@ -8355,6 +8758,10 @@ mod tests {
             no_jcode: false,
             no_muse: false,
             no_antigravity: false,
+            no_bob: false,
+            zcode: false,
+            no_zcode: false,
+            kiro: true,
             no_kiro: false,
             embeddings: false,
             no_embeddings: false,
@@ -8401,7 +8808,7 @@ mod tests {
             jcode: true,
             muse: true,
             antigravity: true,
-            kiro: true,
+            bob: true,
             no_codex: false,
             no_opencode: false,
             no_pi: false,
@@ -8412,6 +8819,10 @@ mod tests {
             no_jcode: false,
             no_muse: false,
             no_antigravity: false,
+            no_bob: false,
+            zcode: false,
+            no_zcode: false,
+            kiro: true,
             no_kiro: false,
             embeddings: false,
             no_embeddings: false,
@@ -8727,7 +9138,8 @@ arguments = {
             std::fs::write(paths.state.join(name), "derived").unwrap();
         }
 
-        reset_reindex_artifacts(&paths).unwrap();
+        let lease = IngestLease::acquire(&paths, "rebuild test", INGEST_LEASE_TIMEOUT).unwrap();
+        reset_reindex_artifacts(&paths, &lease).unwrap();
 
         assert!(!paths.index.exists());
         assert!(!paths.vectors.exists());
@@ -9688,5 +10100,24 @@ arguments = {
         };
         let error = parse_systemd_unit_state("memex-index.service", &unavailable).unwrap_err();
         assert!(error.to_string().contains("Failed to connect to bus"));
+    }
+}
+
+#[cfg(test)]
+mod rebuild_space_tests {
+    use super::*;
+
+    #[test]
+    fn unique_file_bytes_counts_hard_linked_files_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("index");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::write(root.join("a/segment"), vec![7u8; 4096]).unwrap();
+        std::fs::hard_link(root.join("a/segment"), root.join("b/segment")).unwrap();
+        std::fs::write(root.join("b/other"), vec![1u8; 100]).unwrap();
+        assert_eq!(unique_file_bytes(&root).unwrap(), 4196);
+        assert_eq!(unique_file_bytes(&root.join("missing")).unwrap(), 0);
+        assert!(available_bytes(temp.path()).unwrap() > 0);
     }
 }

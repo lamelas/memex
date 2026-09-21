@@ -18,11 +18,13 @@ pub enum SourceKind {
     Jcode,
     Muse,
     Antigravity,
+    Bob,
+    Zcode,
     Kiro,
 }
 
 impl SourceKind {
-    pub const ALL: [SourceKind; 14] = [
+    pub const ALL: [SourceKind; 16] = [
         SourceKind::Claude,
         SourceKind::Codex,
         SourceKind::Opencode,
@@ -36,6 +38,8 @@ impl SourceKind {
         SourceKind::Jcode,
         SourceKind::Muse,
         SourceKind::Antigravity,
+        SourceKind::Bob,
+        SourceKind::Zcode,
         SourceKind::Kiro,
     ];
     pub const COUNT: usize = Self::ALL.len();
@@ -55,7 +59,9 @@ impl SourceKind {
             SourceKind::Jcode => 10,
             SourceKind::Muse => 11,
             SourceKind::Antigravity => 12,
-            SourceKind::Kiro => 13,
+            SourceKind::Bob => 13,
+            SourceKind::Zcode => 14,
+            SourceKind::Kiro => 15,
         }
     }
 
@@ -74,7 +80,9 @@ impl SourceKind {
             10 => Some(SourceKind::Jcode),
             11 => Some(SourceKind::Muse),
             12 => Some(SourceKind::Antigravity),
-            13 => Some(SourceKind::Kiro),
+            13 => Some(SourceKind::Bob),
+            14 => Some(SourceKind::Zcode),
+            15 => Some(SourceKind::Kiro),
             _ => None,
         }
     }
@@ -94,6 +102,8 @@ impl SourceKind {
             SourceKind::Jcode => "jcode",
             SourceKind::Muse => "muse",
             SourceKind::Antigravity => "antigravity",
+            SourceKind::Bob => "bob",
+            SourceKind::Zcode => "zcode",
             SourceKind::Kiro => "kiro",
         }
     }
@@ -113,6 +123,8 @@ impl SourceKind {
             SourceKind::Jcode => "jcode",
             SourceKind::Muse => "muse",
             SourceKind::Antigravity => "antigravity",
+            SourceKind::Bob => "bob",
+            SourceKind::Zcode => "zcode",
             SourceKind::Kiro => "kiro",
         }
     }
@@ -136,13 +148,15 @@ impl SourceKind {
             "jcode" => Some(SourceKind::Jcode),
             "muse" => Some(SourceKind::Muse),
             "antigravity" => Some(SourceKind::Antigravity),
+            "bob" => Some(SourceKind::Bob),
+            "zcode" => Some(SourceKind::Zcode),
             "kiro" => Some(SourceKind::Kiro),
             _ => None,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum, Serialize, Deserialize)]
 #[value(rename_all = "kebab-case")]
 #[serde(rename_all = "kebab-case")]
 pub enum SourceFilter {
@@ -160,6 +174,8 @@ pub enum SourceFilter {
     Jcode,
     Muse,
     Antigravity,
+    Bob,
+    Zcode,
     Kiro,
 }
 
@@ -179,6 +195,8 @@ impl SourceFilter {
             SourceFilter::Jcode => source == SourceKind::Jcode,
             SourceFilter::Muse => source == SourceKind::Muse,
             SourceFilter::Antigravity => source == SourceKind::Antigravity,
+            SourceFilter::Bob => source == SourceKind::Bob,
+            SourceFilter::Zcode => source == SourceKind::Zcode,
             SourceFilter::Kiro => source == SourceKind::Kiro,
         }
     }
@@ -198,6 +216,8 @@ impl SourceFilter {
             SourceFilter::Jcode => &["jcode"],
             SourceFilter::Muse => &["muse"],
             SourceFilter::Antigravity => &["antigravity"],
+            SourceFilter::Bob => &["bob"],
+            SourceFilter::Zcode => &["zcode"],
             SourceFilter::Kiro => &["kiro"],
         }
     }
@@ -217,6 +237,8 @@ impl SourceFilter {
             SourceFilter::Jcode => "jcode",
             SourceFilter::Muse => "muse",
             SourceFilter::Antigravity => "antigravity",
+            SourceFilter::Bob => "bob",
+            SourceFilter::Zcode => "zcode",
             SourceFilter::Kiro => "kiro",
         }
     }

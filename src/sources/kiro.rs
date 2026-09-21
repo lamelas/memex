@@ -470,6 +470,7 @@ pub(crate) fn parse_index_records(
         turn_id,
         pending_tool_calls,
         session_id: Some(session_id),
+        session_cwd: session_cwd(path),
         diagnostics,
     })
 }

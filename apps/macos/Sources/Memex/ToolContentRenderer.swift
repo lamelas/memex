@@ -7,14 +7,18 @@ import AppKit
     /// Relative paths stay as transcript text because their host/workdir is unknown.
     static func imageSources(_ records: [TranscriptRecord]) -> [String] {
         var sources: [String] = []
-        func add(_ source: String?) {
+        @MainActor func add(_ source: String?) {
             guard let source, source.hasPrefix("/") || source.hasPrefix("https://") || source.hasPrefix("http://"), !sources.contains(source) else { return }
             sources.append(source)
         }
-        func inspect(_ value: Any) {
+        @MainActor func inspect(_ value: Any) {
             if let object = value as? [String: Any] {
-                if object["type"] as? String == "image" || object["type"] as? String == "image_url" {
-                    add(object["image_url"] as? String ?? object["url"] as? String ?? (object["image_url"] as? [String: Any])?["url"] as? String)
+                let type = object["type"] as? String
+                if type == "image" || type == "image_url" {
+                    let imageURL = object["image_url"] as? String
+                    let url = object["url"] as? String
+                    let nestedURL = (object["image_url"] as? [String: Any])?["url"] as? String
+                    add(imageURL ?? url ?? nestedURL)
                 }
                 for key in ["content", "result"] { if let nested = object[key] { inspect(nested) } }
             } else if let array = value as? [Any] { for item in array { inspect(item) } }
@@ -43,10 +47,12 @@ import AppKit
             else { blocks.append(.attributed(part)) }
         }
         var seenImages = Set<Data>()
-        func embeddedImages(_ value: Any) {
+        @MainActor func embeddedImages(_ value: Any) {
             if let object = value as? [String: Any] {
+                let mimeType = object["mimeType"] as? String
+                let legacyMimeType = object["mime_type"] as? String
                 if object["type"] as? String == "image", let encoded = object["data"] as? String,
-                   let mime = object["mimeType"] as? String ?? object["mime_type"] as? String,
+                   let mime = mimeType ?? legacyMimeType,
                    mime.hasPrefix("image/"), encoded.utf8.count <= 28_000_000,
                    let data = Data(base64Encoded: encoded), data.count <= 20_000_000, seenImages.insert(data).inserted {
                     blocks.append(.embeddedImage(label: "Image result", data: data, mimeType: mime))
@@ -92,18 +98,42 @@ import AppKit
             valueBlocks(value, to: result, toolName: toolName)
             return
         }
-        // Execution wrappers prepend timing/status lines to a JSON result. Only
-        // split at a line boundary when the entire remaining suffix parses.
-        for boundary in text.indices where text[boundary] == "\n" {
-            var next = text.index(after: boundary)
-            while next < text.endIndex, text[next] == " " || text[next] == "\t" {
-                next = text.index(after: next)
+        // Scan once for complete JSON containers, including adjacent exec results.
+        // Bound presentation work; raw content and Find retain the original bytes.
+        if !code, text.utf8.count <= 256_000 {
+            var cursor = text.startIndex
+            var plainStart = cursor
+            while cursor < text.endIndex {
+                let character = text[cursor]
+                let atBoundary = cursor == text.startIndex || text[text.index(before: cursor)].isWhitespace
+                    || text[text.index(before: cursor)] == "}" || text[text.index(before: cursor)] == "]"
+                guard atBoundary, character == "{" || character == "[" else {
+                    cursor = text.index(after: cursor)
+                    continue
+                }
+                let start = cursor
+                var depth = 0
+                var quoted = false
+                var escaped = false
+                repeat {
+                    let c = text[cursor]
+                    if quoted {
+                        if escaped { escaped = false }
+                        else if c == "\\" { escaped = true }
+                        else if c == "\"" { quoted = false }
+                    } else if c == "\"" { quoted = true }
+                    else if c == "{" || c == "[" { depth += 1 }
+                    else if c == "}" || c == "]" { depth -= 1 }
+                    cursor = text.index(after: cursor)
+                } while cursor < text.endIndex && depth > 0
+                if depth == 0, let value = json(String(text[start..<cursor])) {
+                    append(String(text[plainStart..<start]), to: result, code: code)
+                    valueBlocks(value, to: result, toolName: toolName)
+                    plainStart = cursor
+                }
             }
-            guard next < text.endIndex, text[next] == "{" || text[next] == "[" else { continue }
-            let suffix = String(text[next...])
-            if let value = json(suffix) {
-                append(String(text[...boundary]), to: result, code: code)
-                valueBlocks(value, to: result, toolName: toolName)
+            if plainStart != text.startIndex {
+                append(String(text[plainStart...]), to: result, code: code)
                 return
             }
         }
@@ -114,6 +144,9 @@ import AppKit
 
     private static func json(_ text: String) -> Any? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // The size budget belongs to the adjacent-container scan, not complete
+        // JSON: typed image payloads can exceed it and still need previews and
+        // opaque-data suppression. Image decoding has its own limits above.
         guard trimmed.hasPrefix("{") || trimmed.hasPrefix("[") else { return nil }
         return try? JSONSerialization.jsonObject(with: Data(trimmed.utf8))
     }

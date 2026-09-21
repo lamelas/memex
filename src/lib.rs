@@ -1,6 +1,7 @@
 pub mod analytics;
 pub mod cli;
 pub mod config;
+pub mod daemon_runtime;
 pub mod embed;
 pub mod herdr;
 pub mod index;
@@ -12,8 +13,11 @@ pub mod memory;
 pub mod memory_search;
 #[cfg(unix)]
 mod native;
+#[doc(hidden)]
+pub mod profiling;
 pub mod progress;
 pub mod read_budget;
+mod repository;
 pub mod resume;
 pub mod retrieval;
 pub mod retrieval_eval;

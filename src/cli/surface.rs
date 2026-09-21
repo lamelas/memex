@@ -14,6 +14,12 @@ pub(super) enum IndexCommand {
         #[command(flatten)]
         index: IndexArgs,
     },
+    /// Merge segments below 5% of the corpus, excluding the three largest
+    #[command(hide = true)]
+    Compact {
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
     /// Reclaim unreachable generations (requires stopped readers)
     Gc {
         #[arg(long)]
@@ -107,6 +113,7 @@ impl Commands {
                     dry_run,
                     offline,
                 },
+                IndexCommand::Compact { root } => Self::IndexCompact { root },
                 IndexCommand::Embed { model, root } => Self::Embed { model, root },
                 IndexCommand::Stats { root } => Self::Stats { root },
             },
@@ -175,6 +182,8 @@ pub(super) enum IndexSource {
     Jcode,
     Muse,
     Antigravity,
+    Bob,
+    Zcode,
     Kiro,
 }
 
@@ -193,6 +202,8 @@ impl IndexArgs {
             IndexSource::Jcode => self.jcode && !self.no_jcode,
             IndexSource::Muse => self.muse && !self.no_muse,
             IndexSource::Antigravity => self.antigravity && !self.no_antigravity,
+            IndexSource::Bob => self.bob && !self.no_bob,
+            IndexSource::Zcode => self.zcode && !self.no_zcode,
             IndexSource::Kiro => self.kiro && !self.no_kiro,
         };
         legacy_enabled
@@ -440,7 +451,8 @@ mod tests {
             "--no-jcode",
             "--no-muse",
             "--no-antigravity",
-            "--no-kiro",
+            "--no-bob",
+            "--no-zcode",
         ]);
         assert_eq!(
             selected.source.as_deref(),

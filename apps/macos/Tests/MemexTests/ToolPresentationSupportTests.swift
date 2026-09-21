@@ -61,11 +61,35 @@ struct ToolPresentationSupportTests {
         #expect(ToolContentRenderer.imageSources([call, result]) == ["/tmp/image.png", "https://example.com/image.png"])
     }
 
-    @Test func embeddedImagesKeepOriginalPayloadInRawContent() {
-        let source = #"{"content":[{"type":"image","data":"aGVsbG8=","mimeType":"image/png"}]}"#
+    @Test(arguments: ["mimeType", "mime_type"]) func embeddedImagesKeepOriginalPayloadInRawContent(mimeKey: String) {
+        let source = "{\"content\":[{\"type\":\"image\",\"data\":\"aGVsbG8=\",\"\(mimeKey)\":\"image/png\"}]}"
         let entry = TranscriptRecord(recordID: "image", record: Message(role: "tool_result", text: source, toolName: "custom", toolInput: nil, toolOutput: nil))
         #expect(ToolContentRenderer.richBlocks([entry]).contains(.embeddedImage(label: "Image result", data: Data("hello".utf8), mimeType: "image/png")))
         #expect(ToolContentRenderer.render([entry], raw: true).string == source)
+    }
+
+    @Test(arguments: ["mimeType", "mime_type"]) func largeImageResultsKeepPreviewsAndHideEncodedData(mimeKey: String) throws {
+        let data = Data(repeating: 42, count: 200_000)
+        let payload = data.base64EncodedString()
+        let source = String(decoding: try JSONSerialization.data(withJSONObject: ["content": [
+            ["type": "image", "data": payload, mimeKey: "image/png"],
+            ["type": "image_url", "url": "https://example.com/image.png"],
+        ]]), as: UTF8.self)
+        let entry = TranscriptRecord(recordID: "large-image", record: Message(role: "tool_result", text: "", toolName: "custom", toolInput: nil, toolOutput: source))
+        #expect(source.utf8.count > 256_000)
+        #expect(ToolContentRenderer.richBlocks([entry]).contains(.embeddedImage(label: "Image result", data: data, mimeType: "image/png")))
+        #expect(ToolContentRenderer.imageSources([entry]) == ["https://example.com/image.png"])
+        let rendered = ToolContentRenderer.render([entry]).string
+        #expect(rendered.contains("Encoded payload"))
+        #expect(!rendered.contains(payload))
+        #expect(ToolContentRenderer.render([entry], raw: true).string == source)
+        #expect(ConversationMatcher.matches([entry], query: payload).count == 1)
+    }
+
+    @Test func imageURLFieldsPreservePrecedenceAndFallbacks() {
+        let source = #"{"content":[{"type":"image","image_url":"/tmp/first.png","url":"/tmp/ignored.png"},{"type":"image_url","url":"/tmp/second.png"},{"type":"image_url","image_url":{"url":"/tmp/third.png"}}]}"#
+        let entry = TranscriptRecord(recordID: "images", record: Message(role: "tool_result", text: source, toolName: "custom", toolInput: nil, toolOutput: nil))
+        #expect(ToolContentRenderer.imageSources([entry]) == ["/tmp/first.png", "/tmp/second.png", "/tmp/third.png"])
     }
 
     @Test func explicitInterruptionsAreDistinctFromFailure() {

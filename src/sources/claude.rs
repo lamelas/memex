@@ -10,32 +10,54 @@ use once_cell::sync::Lazy;
 use serde_json::Value;
 use simd_json::prelude::*;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    // Preserve pre-reader fallback IDs independently of attachment-only messages.
-    index: 6,
+    // Preserve pre-reader fallback IDs independently of attachment-only messages,
+    // and classify background transcripts consistently across every record.
+    index: 8,
     usage: 4,
 };
 
 /// Return the human-facing title Claude stores alongside a conversation.
 ///
 /// Title records are metadata rather than transcript messages, so the search
-/// index intentionally does not contain them. The TUI uses this lightweight
-/// reader when it builds the recent-session list.
+/// index intentionally does not contain them. The shared session catalog reads
+/// this metadata so every client sees saved names and subsequent renames.
 pub fn session_title(path: &Path, session_id: &str) -> Option<String> {
-    let reader = BufReader::new(File::open(path).ok()?);
+    use memchr::memchr;
+    use memmap2::Mmap;
+    let file = File::open(path).ok()?;
+    let bytes = unsafe { Mmap::map(&file).ok()? };
     let mut custom_title = None;
     let mut ai_title = None;
     let mut agent_name = None;
 
-    for line in reader.lines().map_while(Result::ok) {
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let remaining = &bytes[offset..];
+        let length = memchr(b'\n', remaining).unwrap_or(remaining.len());
+        let line = &remaining[..length];
+        offset += length + usize::from(length < remaining.len());
+        // Most lines contain large transcript/tool bodies. Only metadata
+        // candidates need JSON decoding; still inspect every line for renames.
+        // Escaped JSON strings may encode the type using Unicode escapes.
+        if ![
+            b"custom-title".as_slice(),
+            b"ai-title",
+            b"agent-name",
+            b"\\u",
+        ]
+        .iter()
+        .any(|needle| memmem::find(line, needle).is_some())
+        {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(line) else {
             continue;
         };
         if value
@@ -60,9 +82,8 @@ pub fn session_title(path: &Path, session_id: &str) -> Option<String> {
                 .and_then(Value::as_str),
             _ => None,
         }
-        .map(str::trim)
-        .filter(|title| !title.is_empty())
-        .map(str::to_string);
+        .map(crate::analytics::sanitize_label)
+        .filter(|title| !title.is_empty());
 
         match entry_type {
             "custom-title" if title.is_some() => custom_title = title,
@@ -75,20 +96,22 @@ pub fn session_title(path: &Path, session_id: &str) -> Option<String> {
     custom_title.or(ai_title).or(agent_name)
 }
 
-pub fn discover(root: &Path, _include_agents: bool) -> Result<Vec<SourceFile>> {
+pub fn discover(
+    root: &Path,
+    _include_agents: bool,
+    walk: Option<&mut crate::ingest::directories::StampedWalk>,
+) -> Result<Vec<SourceFile>> {
     // `_include_agents` is a retired opt-in kept only for CLI compatibility:
     // agent transcripts are always indexed now, matching every other source.
     // Consumers hide them from default views via `conversation_kind`.
     let mut files = Vec::new();
-    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
-        if !entry.file_type().is_file()
-            || entry.path().extension().and_then(|ext| ext.to_str()) != Some("jsonl")
-        {
+    for path in super::common::files_under(root, walk) {
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
             continue;
         }
-        let name = entry.file_name().to_string_lossy();
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
         let is_agent = name.starts_with("agent-");
-        let under_subagents = entry.path().ancestors().any(|ancestor| {
+        let under_subagents = path.ancestors().any(|ancestor| {
             ancestor.file_name().and_then(|name| name.to_str()) == Some("subagents")
         });
         if under_subagents && !is_agent {
@@ -99,8 +122,7 @@ pub fn discover(root: &Path, _include_agents: bool) -> Result<Vec<SourceFile>> {
         // (`<project>/<session>.jsonl`); only agent transcripts nest
         // deeper, under a `subagents/` directory (see `is_subagent_path`).
         // Anything deeper outside `subagents/` is not a session file.
-        let relative_depth = entry
-            .path()
+        let relative_depth = path
             .strip_prefix(root)
             .map(|path| path.components().count())
             .unwrap_or(0);
@@ -109,7 +131,7 @@ pub fn discover(root: &Path, _include_agents: bool) -> Result<Vec<SourceFile>> {
         }
         files.push(SourceFile {
             source: SourceKind::Claude,
-            path: entry.path().to_path_buf(),
+            path,
         });
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
@@ -203,7 +225,18 @@ pub fn is_subagent_path(path: &Path) -> bool {
 }
 
 pub fn classify(path: &Path, is_sidechain: bool) -> ConversationKind {
-    if is_subagent_path(path) {
+    classify_with_session_kind(path, is_sidechain, false)
+}
+
+fn classify_with_session_kind(
+    path: &Path,
+    is_sidechain: bool,
+    is_background: bool,
+) -> ConversationKind {
+    // Claude Code's `bg` transcripts are background workers rather than an
+    // interactive conversation. Reuse the existing subagent origin so all
+    // session views consistently keep them out of the interactive default.
+    if is_background || is_subagent_path(path) {
         ConversationKind::Subagent
     } else if is_sidechain {
         ConversationKind::Sidechain
@@ -212,13 +245,41 @@ pub fn classify(path: &Path, is_sidechain: bool) -> ConversationKind {
     }
 }
 
+fn line_has_background_session_kind(line: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(line)
+        .ok()
+        .is_some_and(|value| value.get("sessionKind").and_then(Value::as_str) == Some("bg"))
+}
+
+/// Detect a background marker in the newly appended portion of a transcript.
+/// Callers persist the result, so normal incremental ingests never revisit
+/// historical lines.
+pub(crate) fn has_background_session_kind_since(
+    path: &Path,
+    offset: u64,
+    byte_boundary: u64,
+) -> Result<bool> {
+    let mut file = File::open(path)?;
+    let end = byte_boundary.min(file.metadata()?.len());
+    let start = offset.min(end);
+    file.seek(SeekFrom::Start(start))?;
+    let reader = BufReader::new(file.take(end - start));
+    for line in reader.split(b'\n') {
+        if line_has_background_session_kind(&line?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub fn probe(path: &Path) -> Result<SourceMetadata> {
     let fallback_id = session_id_from_path(path);
     let mut session_id = fallback_id;
     let mut parent_session_id = None;
     let mut cwd = None;
     let mut project = Some(project_from_path(path));
-    let mut conversation_kind = classify(path, false);
+    let mut is_background = false;
+    let mut conversation_kind = classify_with_session_kind(path, false, is_background);
 
     let reader = BufReader::new(File::open(path)?);
     for line in reader.lines().take(64) {
@@ -226,6 +287,7 @@ pub fn probe(path: &Path) -> Result<SourceMetadata> {
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        is_background |= value.get("sessionKind").and_then(Value::as_str) == Some("bg");
         if let Some(id) = value.get("sessionId").and_then(Value::as_str) {
             session_id = id.to_string();
         }
@@ -237,8 +299,8 @@ pub fn probe(path: &Path) -> Result<SourceMetadata> {
             .get("isSidechain")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        conversation_kind = classify(path, sidechain);
-        if conversation_kind == ConversationKind::Subagent {
+        conversation_kind = classify_with_session_kind(path, sidechain, is_background);
+        if is_subagent_path(path) {
             parent_session_id = value
                 .get("sessionId")
                 .and_then(Value::as_str)
@@ -263,13 +325,35 @@ pub fn probe(path: &Path) -> Result<SourceMetadata> {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn parse_index_records(
     path: &Path,
     state: IndexParseState,
     include_reasoning: bool,
     next_doc_id: &AtomicU64,
-    mut emit: impl FnMut(Record) -> Result<()>,
+    emit: impl FnMut(Record) -> Result<()>,
 ) -> Result<IndexParseOutput> {
+    parse_index_records_with_background(
+        path,
+        state,
+        include_reasoning,
+        None,
+        File::open(path)?.metadata()?.len(),
+        next_doc_id,
+        emit,
+    )
+    .map(|(output, _)| output)
+}
+
+pub(crate) fn parse_index_records_with_background(
+    path: &Path,
+    state: IndexParseState,
+    include_reasoning: bool,
+    known_background: Option<bool>,
+    byte_boundary: u64,
+    next_doc_id: &AtomicU64,
+    mut emit: impl FnMut(Record) -> Result<()>,
+) -> Result<(IndexParseOutput, bool)> {
     let mut legacy_turn_id = state.legacy_ordinal()?;
     let mut emit = |mut record: Record| {
         if record.links.source_record_offset.is_none() {
@@ -279,11 +363,22 @@ pub(crate) fn parse_index_records(
         emit(record)
     };
     use memchr::memchr;
-    use memmap2::Mmap;
     use simd_json::prelude::*;
 
     let file = File::open(path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
+    let mmap = super::common::map_sequential(&file)?;
+    // Discovery captured this boundary before parsing began. Never consume
+    // bytes appended after it: they need a fresh metadata probe so a late
+    // `sessionKind: "bg"` marker can reclassify the whole transcript.
+    let defer_unterminated_tail = byte_boundary < mmap.len() as u64;
+    let mmap = &mmap[..byte_boundary.min(mmap.len() as u64) as usize];
+    // `sessionKind` is not repeated on every event. Establish this file-level
+    // origin before emitting any records so a later `bg` marker cannot leave
+    // the transcript split between interactive and background classifications.
+    let is_background = known_background.unwrap_or_else(|| {
+        mmap.split(|byte| *byte == b'\n')
+            .any(line_has_background_session_kind)
+    });
     let mut start = state.offset as usize;
     let mut turn_id = state.turn_id;
     let mut pending_tool_calls = state.pending_tool_calls;
@@ -293,13 +388,23 @@ pub(crate) fn parse_index_records(
     let source_path = path.to_string_lossy().to_string();
     let mut buffer = Vec::new();
     let mut diagnostics = ParseDiagnostics::default();
+    let mut session_cwd: Option<String> = None;
 
     while start < mmap.len() {
         let source_record_offset = start as u64;
         let slice = &mmap[start..];
         let relative = memchr(b'\n', slice).unwrap_or(slice.len());
+        let has_newline = relative < slice.len();
+        // The task metadata can race a writer which has appended only part of
+        // a JSONL record. Do not classify that prefix as malformed: retain its
+        // start offset so the next ingest reads the complete record. A final
+        // non-newline record is still valid when this mmap is exactly the task
+        // boundary.
+        if !has_newline && defer_unterminated_tail {
+            break;
+        }
         let line = &slice[..relative];
-        start += relative + 1;
+        start += relative + usize::from(has_newline);
         if line.is_empty() {
             continue;
         }
@@ -308,6 +413,16 @@ pub(crate) fn parse_index_records(
         let value = match simd_json::to_borrowed_value(&mut buffer) {
             Ok(value) => value,
             Err(_) => {
+                // A writer can pause mid-record without growing the file
+                // between discovery and mmap. Retry that incomplete JSON on
+                // the next append, while still accepting complete final JSON
+                // without a newline and diagnosing malformed complete lines.
+                if !has_newline
+                    && serde_json::from_slice::<Value>(line).is_err_and(|error| error.is_eof())
+                {
+                    start = source_record_offset as usize;
+                    break;
+                }
                 diagnostics.malformed_json_lines += 1;
                 continue;
             }
@@ -316,6 +431,12 @@ pub(crate) fn parse_index_records(
             diagnostics.non_object_json_lines += 1;
             continue;
         };
+        if session_cwd.is_none()
+            && let Some(cwd) = object.get("cwd").and_then(|value| value.as_str())
+            && !cwd.is_empty()
+        {
+            session_cwd = Some(cwd.to_string());
+        }
         let entry_type = object
             .get("type")
             .and_then(|value| value.as_str())
@@ -347,7 +468,7 @@ pub(crate) fn parse_index_records(
             .get("isSidechain")
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
-        let kind = classify(path, sidechain);
+        let kind = classify_with_session_kind(path, sidechain, is_background);
         let thread_source = match kind {
             ConversationKind::Subagent => Some("subagent".to_string()),
             ConversationKind::Sidechain => Some("sidechain".to_string()),
@@ -605,14 +726,18 @@ pub(crate) fn parse_index_records(
         }
     }
 
-    Ok(IndexParseOutput {
-        offset: mmap.len() as u64,
-        turn_id,
-        legacy_turn_id: Some(legacy_turn_id),
-        pending_tool_calls,
-        session_id: Some(session_id),
-        diagnostics,
-    })
+    Ok((
+        IndexParseOutput {
+            offset: start as u64,
+            turn_id,
+            legacy_turn_id: Some(legacy_turn_id),
+            pending_tool_calls,
+            session_id: Some(session_id),
+            diagnostics,
+            session_cwd,
+        },
+        is_background,
+    ))
 }
 
 pub(crate) fn parse_usage_file(path: &Path) -> Result<Vec<UsageEvent>> {
@@ -823,8 +948,8 @@ mod tests {
         fs::write(temp.path().join("main.jsonl"), "{}\n").unwrap();
         fs::write(temp.path().join("agent-child.jsonl"), "{}\n").unwrap();
         // The retired opt-in flag no longer gates anything.
-        assert_eq!(discover(temp.path(), false).unwrap().len(), 2);
-        assert_eq!(discover(temp.path(), true).unwrap().len(), 2);
+        assert_eq!(discover(temp.path(), false, None).unwrap().len(), 2);
+        assert_eq!(discover(temp.path(), true, None).unwrap().len(), 2);
     }
 
     #[test]
@@ -835,7 +960,7 @@ mod tests {
         fs::write(subagents.join("agent-child.jsonl"), "{}\n").unwrap();
         fs::write(subagents.join("journal.jsonl"), "{}\n").unwrap();
 
-        let files = discover(temp.path(), false).unwrap();
+        let files = discover(temp.path(), false, None).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(
             files[0].path.file_name().and_then(|name| name.to_str()),
@@ -864,6 +989,96 @@ mod tests {
     }
 
     #[test]
+    fn background_session_kind_marks_the_complete_transcript_non_interactive() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("background.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"user\",\"sessionId\":\"background\",\"message\":{\"content\":\"before marker\"}}\n",
+                "{\"type\":\"assistant\",\"sessionKind\":\"bg\",\"message\":{\"content\":\"background work\"}}\n",
+                "{\"type\":\"user\",\"message\":{\"content\":\"after marker\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            probe(&path).unwrap().session.conversation_kind,
+            ConversationKind::Subagent
+        );
+        let mut records = Vec::new();
+        parse_index_records(
+            &path,
+            IndexParseState::default(),
+            false,
+            &AtomicU64::new(1),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(records.iter().all(|record| {
+            record.links.conversation_kind.as_deref() == Some("subagent")
+                && record.links.thread_source.as_deref() == Some("subagent")
+        }));
+    }
+
+    #[test]
+    fn probe_keeps_background_detection_to_its_bounded_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("late-background.jsonl");
+        let mut transcript = String::new();
+        for index in 0..64 {
+            transcript.push_str(&format!(
+                r#"{{"type":"user","sessionId":"session","message":{{"content":"{index}"}}}}"#
+            ));
+            transcript.push('\n');
+        }
+        transcript.push_str(
+            r#"{"type":"assistant","sessionKind":"bg","message":{"content":"late marker"}}
+"#,
+        );
+        fs::write(&path, transcript).unwrap();
+
+        // Ingest persists and incrementally updates the complete file-level
+        // classification. Probe is intentionally a bounded metadata reader.
+        assert_eq!(
+            probe(&path).unwrap().session.conversation_kind,
+            ConversationKind::Main
+        );
+    }
+
+    #[test]
+    fn parser_accepts_a_final_non_newline_record_at_the_task_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("final-record.jsonl");
+        let line = r#"{"type":"user","message":{"content":"final record"}}"#;
+        fs::write(&path, line).unwrap();
+
+        let mut records = Vec::new();
+        let (parsed, background) = parse_index_records_with_background(
+            &path,
+            IndexParseState::default(),
+            false,
+            None,
+            line.len() as u64,
+            &AtomicU64::new(1),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(!background);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].text, "final record");
+        assert_eq!(parsed.offset, line.len() as u64);
+    }
+
+    #[test]
     fn session_title_prefers_custom_title_over_ai_title() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("session.jsonl");
@@ -881,6 +1096,52 @@ mod tests {
             Some("My title")
         );
         assert_eq!(session_title(&path, "another-session"), None);
+    }
+
+    #[test]
+    fn session_title_scans_past_large_messages_and_keeps_last_matching_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let lines = [
+            serde_json::json!({"type":"custom-title", "sessionId":"s", "customTitle":"Original"}),
+            serde_json::json!({"type":"assistant", "message":{"content":"x".repeat(262144)}}),
+            serde_json::json!({"type":"assistant", "customTitle":"False match", "message":{"content":"custom-title"}}),
+            serde_json::json!({"type":"custom-title", "sessionId":"other", "customTitle":"Other session"}),
+            serde_json::json!({"type":"agent-name", "sessionId":"s", "agentName":"Agent name"}),
+            serde_json::json!({"type":"custom-title", "sessionId":"s", "customTitle":"Renamed"}),
+            serde_json::json!({"type":"ai-title", "sessionId":"s", "aiTitle":"Later generated title"}),
+        ];
+        // The final event intentionally has no trailing newline.
+        fs::write(
+            &path,
+            lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        assert_eq!(session_title(&path, "s").as_deref(), Some("Renamed"));
+        assert_eq!(
+            session_title(&path, "other").as_deref(),
+            Some("Other session")
+        );
+    }
+
+    #[test]
+    fn session_title_keeps_agent_fallback_and_empty_file_behavior() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        fs::write(&path, "").unwrap();
+        assert_eq!(session_title(&path, "s"), None);
+        fs::write(&path, "malformed custom-title\n{\"type\":\"agent-name\",\"sessionId\":\"s\",\"name\":\"Task name\"}").unwrap();
+        assert_eq!(session_title(&path, "s").as_deref(), Some("Task name"));
+        fs::write(
+            &path,
+            r#"{"type":"ai\u002dtitle","sessionId":"s","aiTitle":"Escaped type"}"#,
+        )
+        .unwrap();
+        assert_eq!(session_title(&path, "s").as_deref(), Some("Escaped type"));
     }
 
     #[test]

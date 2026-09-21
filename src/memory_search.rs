@@ -14,15 +14,19 @@ use crate::read_budget::{ContentContinuation, ContentPage, ReadField};
 use crate::types::SourceKind;
 use crate::vector::VectorIndex;
 use anyhow::{Context, Result, anyhow, bail};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Arc, LazyLock, Mutex};
 use tantivy::collector::TopDocs;
 use tantivy::query::{AllQuery, Query, QueryParser};
-use tantivy::schema::{INDEXED, STORED, Schema, TEXT, Value};
-use tantivy::{Index, ReloadPolicy, TantivyDocument};
+use tantivy::schema::{
+    INDEXED, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value,
+};
+use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument};
 
 const DEFAULT_SEARCH_LIMIT: usize = 20;
 const DEFAULT_MAX_PER_DOCUMENT: usize = 2;
@@ -225,10 +229,87 @@ struct LexicalFields {
 
 struct LexicalMemoryIndex {
     index: Index,
+    reader: IndexReader,
     fields: LexicalFields,
 }
 
+// Process ownership is intentional: MemoryStore and federated worker threads are recreated
+// for each request, including requests in long-lived MCP servers.
+static MEMORY_LEXICAL_CACHE: LazyLock<MemoryLexicalCache> =
+    LazyLock::new(MemoryLexicalCache::default);
+const MEMORY_LEXICAL_CACHE_CAPACITY: usize = 8;
+
+#[derive(Default)]
+struct MemoryLexicalCache {
+    entries: Mutex<VecDeque<(LexicalCacheKey, Arc<LexicalMemoryIndex>)>>,
+}
+
+#[derive(PartialEq, Eq)]
+struct LexicalCacheKey {
+    snapshot_path: PathBuf,
+    rows_sha256: [u8; 32],
+}
+
+impl MemoryLexicalCache {
+    fn get(
+        &self,
+        paths: &Paths,
+        snapshot: &MemorySnapshot,
+        candidates: &[SectionCandidate],
+    ) -> Result<Arc<LexicalMemoryIndex>> {
+        // Hash the exact ordered rows passed to build, including field boundaries and IDs.
+        // Versions alone miss title/heading changes. Hashing all sections would lose scope
+        // identity and reuse BM25 statistics from the wrong eligible corpus.
+        let mut digest = Sha256::new();
+        for candidate in candidates {
+            let document = &snapshot.documents[candidate.document];
+            let section = &document.sections[candidate.section];
+            digest.update(candidate.vector_id.to_le_bytes());
+            for value in [
+                Some(section.content.as_str()),
+                section.heading.as_deref(),
+                document.title.as_deref(),
+            ] {
+                digest.update([u8::from(value.is_some())]);
+                let bytes = value.unwrap_or_default().as_bytes();
+                digest.update((bytes.len() as u64).to_le_bytes());
+                digest.update(bytes);
+            }
+        }
+        let key = LexicalCacheKey {
+            snapshot_path: std::path::absolute(memory_snapshot_path(paths))?,
+            rows_sha256: digest.finalize().into(),
+        };
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| anyhow!("memory lexical cache lock poisoned"))?;
+        if let Some(position) = entries.iter().position(|(cached, _)| cached == &key) {
+            let entry = entries.remove(position).expect("cache entry exists");
+            let index = Arc::clone(&entry.1);
+            entries.push_back(entry);
+            return Ok(index);
+        }
+        // Serialize misses to avoid duplicate builds and bound simultaneous writer memory.
+        // Searches run outside this lock; eviction only drops the cache's Arc.
+        let index = Arc::new(LexicalMemoryIndex::build(snapshot, candidates)?);
+        if entries.len() == MEMORY_LEXICAL_CACHE_CAPACITY {
+            entries.pop_front();
+        }
+        entries.push_back((key, Arc::clone(&index)));
+        Ok(index)
+    }
+}
+
 pub fn search_memory(paths: &Paths, options: &MemorySearchOptions) -> Result<Vec<MemorySearchHit>> {
+    search_memory_with_cache(paths, options, &MEMORY_LEXICAL_CACHE)
+}
+
+fn search_memory_with_cache(
+    paths: &Paths,
+    options: &MemorySearchOptions,
+    cache: &MemoryLexicalCache,
+) -> Result<Vec<MemorySearchHit>> {
     options.validate()?;
     let queries = normalized_query_views(options)?;
     let store = MemoryStore::new(memory_snapshot_path(paths));
@@ -242,7 +323,7 @@ pub fn search_memory(paths: &Paths, options: &MemorySearchOptions) -> Result<Vec
         options.mode,
         MemorySearchMode::Lexical | MemorySearchMode::Hybrid
     ) {
-        Some(LexicalMemoryIndex::build(&snapshot, &candidates)?)
+        Some(cache.get(paths, &snapshot, &candidates)?)
     } else {
         None
     };
@@ -565,6 +646,23 @@ pub fn embed_memory(
     model: ModelChoice,
     runtime: &EmbedRuntimeConfig,
 ) -> Result<usize> {
+    let mut embedder = None;
+    embed_memory_with(paths, model, |texts| {
+        if embedder.is_none() {
+            embedder = Some(EmbedderHandle::with_model_and_runtime(model, runtime)?);
+        }
+        embedder
+            .as_mut()
+            .expect("embedder initialized")
+            .embed_texts(texts)
+    })
+}
+
+fn embed_memory_with(
+    paths: &Paths,
+    model: ModelChoice,
+    mut embed: impl FnMut(&[&str]) -> Result<Vec<Vec<f32>>>,
+) -> Result<usize> {
     let snapshot = MemoryStore::new(memory_snapshot_path(paths)).load()?;
     let candidates = all_searchable_sections(&snapshot)?;
     if candidates.is_empty() {
@@ -572,15 +670,27 @@ pub fn embed_memory(
     }
     let snapshot_key = snapshot_fingerprint(&snapshot);
     let vector_path = memory_vector_path(paths, &snapshot_key);
+    // Cache the actual model input, independently of document versions and section IDs.
+    // Commit each batch so an interrupted snapshot build can reuse its completed inference.
+    let mut cache = Connection::open(paths.root.join("memory/section-embeddings.sqlite3"))?;
+    cache.busy_timeout(std::time::Duration::from_secs(30))?;
+    cache.execute_batch(
+        "CREATE TABLE IF NOT EXISTS embeddings (
+            model TEXT NOT NULL,
+            content_sha256 TEXT NOT NULL,
+            embedding BLOB NOT NULL,
+            PRIMARY KEY (model, content_sha256)
+        ) WITHOUT ROWID",
+    )?;
+    seed_memory_embedding_cache(&mut cache, paths, model, &snapshot, &candidates)?;
     if let Ok(existing) = VectorIndex::open(&vector_path)
         && existing.model() == Some(model.as_str())
         && validate_vector_inventory(&existing, &candidates).is_ok()
     {
         return Ok(0);
     }
-    let mut embedder = EmbedderHandle::with_model_and_runtime(model, runtime)?;
-    let mut vector =
-        VectorIndex::empty_replacement(&vector_path, embedder.dims, Some(model.as_str()))?;
+    let mut vector = None;
+    let mut embedded = 0;
     for batch in candidates.chunks(64) {
         let texts = batch
             .iter()
@@ -590,20 +700,137 @@ pub fn embed_memory(
                     .as_str()
             })
             .collect::<Vec<_>>();
-        let embeddings = embedder.embed_texts(&texts)?;
-        if embeddings.len() != batch.len() {
+        let keys = texts
+            .iter()
+            .map(|text| format!("{:x}", Sha256::digest(text.as_bytes())))
+            .collect::<Vec<_>>();
+        let mut embeddings =
+            keys.iter()
+                .map(|key| -> Result<Option<Vec<f32>>> {
+                    let bytes: Option<Vec<u8>> = cache.query_row(
+                    "SELECT embedding FROM embeddings WHERE model = ?1 AND content_sha256 = ?2",
+                    params![model.as_str(), key],
+                    |row| row.get(0),
+                ).optional()?;
+                    Ok(bytes
+                        .map(|bytes| serde_json::from_slice(&bytes))
+                        .transpose()?)
+                })
+                .collect::<Result<Vec<_>>>()?;
+        let missing = embeddings
+            .iter()
+            .enumerate()
+            .filter_map(|(index, embedding)| embedding.is_none().then_some(index))
+            .collect::<Vec<_>>();
+        let new_embeddings = if missing.is_empty() {
+            Vec::new()
+        } else {
+            embed(
+                &missing
+                    .iter()
+                    .map(|&index| texts[index])
+                    .collect::<Vec<_>>(),
+            )?
+        };
+        if new_embeddings.len() != missing.len() {
             bail!(
                 "memory embedder returned {} vectors for {} sections",
-                embeddings.len(),
-                batch.len()
+                new_embeddings.len(),
+                missing.len()
             );
         }
-        for (candidate, embedding) in batch.iter().zip(embeddings) {
-            vector.add(candidate.vector_id, &embedding)?;
+        for (&index, embedding) in missing.iter().zip(new_embeddings) {
+            embeddings[index] = Some(embedding);
+        }
+        for (candidate, embedding) in batch.iter().zip(&embeddings) {
+            let embedding = embedding.as_ref().expect("cached or embedded");
+            if embedding.is_empty() || embedding.iter().any(|value| !value.is_finite()) {
+                bail!("memory embedder returned an empty or non-finite vector");
+            }
+            if vector.is_none() {
+                vector = Some(VectorIndex::empty_replacement(
+                    &vector_path,
+                    model.known_dimensions().unwrap_or(embedding.len()),
+                    Some(model.as_str()),
+                )?);
+            }
+            vector
+                .as_mut()
+                .expect("vector initialized")
+                .add(candidate.vector_id, embedding)?;
+        }
+        let transaction = cache.transaction()?;
+        for &index in &missing {
+            transaction.execute(
+                "INSERT OR IGNORE INTO embeddings (model, content_sha256, embedding) VALUES (?1, ?2, ?3)",
+                params![model.as_str(), keys[index], serde_json::to_vec(embeddings[index].as_ref().expect("embedded"))?],
+            )?;
+        }
+        transaction.commit()?;
+        embedded += missing.len();
+    }
+    vector.expect("non-empty candidates").save()?;
+    Ok(embedded)
+}
+
+/// Bootstrap older installations from saved vectors without running the model again.
+fn seed_memory_embedding_cache(
+    cache: &mut Connection,
+    paths: &Paths,
+    model: ModelChoice,
+    snapshot: &MemorySnapshot,
+    candidates: &[SectionCandidate],
+) -> Result<()> {
+    let populated: bool = cache.query_row(
+        "SELECT EXISTS(SELECT 1 FROM embeddings WHERE model = ?1)",
+        [model.as_str()],
+        |row| row.get(0),
+    )?;
+    if populated {
+        return Ok(());
+    }
+    let root = paths.root.join("memory").join(MEMORY_VECTOR_DIR);
+    if !root.exists() {
+        return Ok(());
+    }
+    let mut remaining = candidates.to_vec();
+    let transaction = cache.transaction()?;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        // Old or incomplete generations are optional reuse sources, never authoritative.
+        let Ok(vector) = VectorIndex::open(&entry.path()) else {
+            continue;
+        };
+        if vector.model() != Some(model.as_str()) {
+            continue;
+        }
+        let mut missing = Vec::new();
+        for candidate in remaining {
+            if let Some(embedding) = vector.embedding(candidate.vector_id)? {
+                let text =
+                    &snapshot.documents[candidate.document].sections[candidate.section].content;
+                transaction.execute(
+                    "INSERT OR IGNORE INTO embeddings (model, content_sha256, embedding) VALUES (?1, ?2, ?3)",
+                    params![model.as_str(), format!("{:x}", Sha256::digest(text.as_bytes())), serde_json::to_vec(&embedding)?],
+                )?;
+            } else {
+                missing.push(candidate);
+            }
+        }
+        remaining = missing;
+        if remaining.is_empty() {
+            break;
         }
     }
-    vector.save()?;
-    Ok(candidates.len())
+    transaction.commit()?;
+    let reused = candidates.len() - remaining.len();
+    if reused > 0 {
+        eprintln!("memory embedding cache: reused {reused} saved section vectors");
+    }
+    Ok(())
 }
 
 /// Remove generated vector snapshots other than the one matching the current document snapshot.
@@ -663,9 +890,14 @@ impl LexicalMemoryIndex {
     fn build(snapshot: &MemorySnapshot, candidates: &[SectionCandidate]) -> Result<Self> {
         let mut schema = Schema::builder();
         let key = schema.add_u64_field("key", INDEXED | STORED);
-        let text = schema.add_text_field("text", TEXT);
-        let heading = schema.add_text_field("heading", TEXT);
-        let title = schema.add_text_field("title", TEXT);
+        let stemmed = TextOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("en_stem")
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        );
+        let text = schema.add_text_field("text", stemmed.clone());
+        let heading = schema.add_text_field("heading", stemmed.clone());
+        let title = schema.add_text_field("title", stemmed);
         let index = Index::create_in_ram(schema.build());
         let mut writer = index.writer(15_000_000)?;
         for candidate in candidates {
@@ -683,8 +915,13 @@ impl LexicalMemoryIndex {
             writer.add_document(row)?;
         }
         writer.commit()?;
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
         Ok(Self {
             index,
+            reader,
             fields: LexicalFields {
                 key,
                 text,
@@ -695,12 +932,7 @@ impl LexicalMemoryIndex {
     }
 
     fn search(&self, query: &str, limit: usize) -> Result<Vec<(u64, f32)>> {
-        let reader = self
-            .index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::Manual)
-            .try_into()?;
-        let searcher = reader.searcher();
+        let searcher = self.reader.searcher();
         let parsed: Box<dyn Query> = if query == "*" {
             Box::new(AllQuery)
         } else {
@@ -1107,6 +1339,8 @@ mod tests {
             },
             kind: MemoryDocumentKind::Note,
             mtime_ms,
+            size: 0,
+            changed_ns: None,
             event_dates: Vec::new(),
             title: Some(format!("{project} notes")),
             content,
@@ -1139,6 +1373,316 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn lexical_cache_reuses_searches_and_reads_updated_snapshot_metadata() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().join("store"))).unwrap();
+        let cache = MemoryLexicalCache::default();
+        let mut doc = document(
+            temp.path().join("one.md"),
+            "one",
+            "alpha",
+            100,
+            &[("a", "rust cache"), ("b", "rust verification")],
+        );
+        write_snapshot(&paths, vec![doc.clone()]);
+        let options = MemorySearchOptions {
+            query: "rust".into(),
+            recency_weight: 0.0,
+            ..Default::default()
+        };
+        let first = search_memory_with_cache(&paths, &options, &cache).unwrap();
+        let index = Arc::clone(&cache.entries.lock().unwrap()[0].1);
+        for _ in 0..10 {
+            let hits = search_memory_with_cache(&paths, &options, &cache).unwrap();
+            assert_eq!(hits[0].score, first[0].score);
+            assert!(Arc::ptr_eq(&index, &cache.entries.lock().unwrap()[0].1));
+        }
+        // Presentation and query changes must not rebuild the corpus or its reader.
+        doc.mtime_ms = 200;
+        write_snapshot(&paths, vec![doc]);
+        let hits = search_memory_with_cache(
+            &paths,
+            &MemorySearchOptions {
+                query: "cache".into(),
+                additional_queries: vec!["verification".into()],
+                include_text: true,
+                ..options
+            },
+            &cache,
+        )
+        .unwrap();
+        assert!(
+            hits.iter()
+                .all(|hit| hit.mtime_ms == 200 && hit.text.is_some())
+        );
+        assert!(Arc::ptr_eq(&index, &cache.entries.lock().unwrap()[0].1));
+        assert_eq!(cache.entries.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn lexical_cache_invalidates_every_indexed_field_and_section_inventory() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().join("store"))).unwrap();
+        let cache = MemoryLexicalCache::default();
+        let doc = document(
+            temp.path().join("one.md"),
+            "one",
+            "alpha",
+            100,
+            &[("a", "rust cache"), ("b", "rust verification")],
+        );
+        let original = MemorySnapshot {
+            documents: vec![doc],
+            ..Default::default()
+        };
+        let candidates = all_searchable_sections(&original).unwrap();
+        let index = cache.get(&paths, &original, &candidates).unwrap();
+        for change in [
+            "text",
+            "heading",
+            "title",
+            "version",
+            "section ID",
+            "deletion",
+            "addition",
+            "order",
+        ] {
+            let mut snapshot = original.clone();
+            let doc = &mut snapshot.documents[0];
+            match change {
+                "text" => doc.sections[0].content = "replacement".into(),
+                "heading" => doc.sections[0].heading = Some("replacement".into()),
+                "title" => doc.title = Some("replacement".into()),
+                "version" => doc.version_sha256 = "replacement".into(),
+                "section ID" => doc.sections[0].id = "replacement".into(),
+                "deletion" => {
+                    doc.sections.remove(0);
+                }
+                "addition" => {
+                    let mut added = doc.sections[0].clone();
+                    added.id = "added".into();
+                    doc.sections.push(added);
+                }
+                "order" => doc.sections.reverse(),
+                _ => unreachable!(),
+            }
+            write_snapshot(&paths, snapshot.documents.clone());
+            let options = MemorySearchOptions {
+                query: "rust".into(),
+                recency_weight: 0.0,
+                ..Default::default()
+            };
+            let hits = search_memory_with_cache(&paths, &options, &cache).unwrap();
+            let candidates = eligible_sections(&snapshot, &options).unwrap();
+            let cached = cache.get(&paths, &snapshot, &candidates).unwrap();
+            assert!(!Arc::ptr_eq(&index, &cached), "change {change}");
+            let fresh = LexicalMemoryIndex::build(&snapshot, &candidates).unwrap();
+            assert_eq!(
+                cached.search("rust", 10).unwrap(),
+                fresh.search("rust", 10).unwrap()
+            );
+            assert!(hits.iter().all(|hit| {
+                snapshot.documents[0]
+                    .sections
+                    .iter()
+                    .any(|section| section.id == hit.section_id)
+            }));
+            if matches!(change, "text" | "heading" | "title") {
+                assert!(!cached.search("replacement", 10).unwrap().is_empty());
+                assert!(index.search("replacement", 10).unwrap().is_empty());
+            }
+        }
+        write_snapshot(&paths, Vec::new());
+        assert!(
+            search_memory_with_cache(
+                &paths,
+                &MemorySearchOptions {
+                    query: "rust".into(),
+                    ..Default::default()
+                },
+                &cache
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn lexical_cache_preserves_scoped_bm25_and_isolates_roots() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().join("store"))).unwrap();
+        let other_paths = Paths::new(Some(temp.path().join("other"))).unwrap();
+        let cache = MemoryLexicalCache::default();
+        let mut beta = document(
+            temp.path().join("two.md"),
+            "two",
+            "beta",
+            200,
+            &[("a", "rust rust rust other words")],
+        );
+        beta.provider = SourceKind::Claude;
+        let snapshot = MemorySnapshot {
+            documents: vec![
+                document(
+                    temp.path().join("one.md"),
+                    "one",
+                    "alpha",
+                    100,
+                    &[("a", "rust cache"), ("b", "unrelated words")],
+                ),
+                beta,
+            ],
+            ..Default::default()
+        };
+        let options = MemorySearchOptions {
+            query: "rust".into(),
+            recency_weight: 0.0,
+            ..Default::default()
+        };
+        let all = eligible_sections(&snapshot, &options).unwrap();
+        let full = cache.get(&paths, &snapshot, &all).unwrap();
+        let mut scoped_index = None;
+        for scope in [
+            MemorySearchOptions {
+                project: Some("alpha".into()),
+                ..options.clone()
+            },
+            MemorySearchOptions {
+                cwd: Some("/work/alpha".into()),
+                ..options.clone()
+            },
+            MemorySearchOptions {
+                source: Some(SourceKind::Codex),
+                ..options.clone()
+            },
+            MemorySearchOptions {
+                until: Some(100),
+                ..options.clone()
+            },
+            MemorySearchOptions {
+                since: Some(100),
+                until: Some(199),
+                ..options.clone()
+            },
+        ] {
+            let candidates = eligible_sections(&snapshot, &scope).unwrap();
+            let cached = cache.get(&paths, &snapshot, &candidates).unwrap();
+            let fresh = LexicalMemoryIndex::build(&snapshot, &candidates).unwrap();
+            let ranking = cached.search("rust", 10).unwrap();
+            assert_eq!(ranking, fresh.search("rust", 10).unwrap());
+            assert_eq!(ranking.len(), 1);
+            assert_ne!(
+                ranking[0].1,
+                full.search("rust", 10)
+                    .unwrap()
+                    .iter()
+                    .find(|(id, _)| *id == ranking[0].0)
+                    .unwrap()
+                    .1
+            );
+            if let Some(previous) = &scoped_index {
+                assert!(Arc::ptr_eq(previous, &cached));
+            }
+            scoped_index = Some(cached);
+        }
+        let other = cache.get(&other_paths, &snapshot, &all).unwrap();
+        assert!(!Arc::ptr_eq(&full, &other));
+        // A filter can select a different corpus after a metadata-only snapshot update.
+        let mut moved = snapshot.clone();
+        moved.documents[0].scope.project = Some("beta".into());
+        moved.documents[1].scope.project = Some("alpha".into());
+        write_snapshot(&paths, moved.documents.clone());
+        let hits = search_memory_with_cache(
+            &paths,
+            &MemorySearchOptions {
+                project: Some("alpha".into()),
+                ..options
+            },
+            &cache,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].memory_id, "two");
+    }
+
+    #[test]
+    fn lexical_cache_coalesces_concurrent_builds_and_eviction_retains_active_searches() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().join("store"))).unwrap();
+        let cache = MemoryLexicalCache::default();
+        let snapshot = MemorySnapshot {
+            documents: vec![document(
+                temp.path().join("one.md"),
+                "one",
+                "alpha",
+                100,
+                &[("a", "rust cache")],
+            )],
+            ..Default::default()
+        };
+        let candidates = all_searchable_sections(&snapshot).unwrap();
+        let barrier = std::sync::Barrier::new(4);
+        let indexes = std::thread::scope(|scope| {
+            let workers = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        let index = cache.get(&paths, &snapshot, &candidates).unwrap();
+                        assert_eq!(index.search("rust", 10).unwrap().len(), 1);
+                        index
+                    })
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(indexes.iter().all(|index| Arc::ptr_eq(index, &indexes[0])));
+        let first = &indexes[0];
+        let mut second = None;
+        for i in 0..MEMORY_LEXICAL_CACHE_CAPACITY - 1 {
+            let mut changed = snapshot.clone();
+            changed.documents[0].title = Some(format!("title {i}"));
+            let index = cache.get(&paths, &changed, &candidates).unwrap();
+            if i == 0 {
+                second = Some(Arc::downgrade(&index));
+            }
+        }
+        // Touch the oldest entry; the second entry should now be evicted.
+        assert!(Arc::ptr_eq(
+            first,
+            &cache.get(&paths, &snapshot, &candidates).unwrap()
+        ));
+        let mut changed = snapshot.clone();
+        changed.documents[0].title = Some("last".into());
+        cache.get(&paths, &changed, &candidates).unwrap();
+        assert!(second.unwrap().upgrade().is_none());
+        assert_eq!(
+            cache.entries.lock().unwrap().len(),
+            MEMORY_LEXICAL_CACHE_CAPACITY
+        );
+        // Force the original out while a worker holds and searches its immutable reader.
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                for _ in 0..100 {
+                    assert_eq!(first.search("rust", 10).unwrap().len(), 1);
+                }
+            });
+            for i in 0..MEMORY_LEXICAL_CACHE_CAPACITY {
+                changed.documents[0].title = Some(format!("evict {i}"));
+                cache.get(&paths, &changed, &candidates).unwrap();
+            }
+            worker.join().unwrap();
+        });
+        assert_eq!(first.search("rust", 10).unwrap().len(), 1);
+        assert!(!Arc::ptr_eq(
+            first,
+            &cache.get(&paths, &snapshot, &candidates).unwrap()
+        ));
     }
 
     #[test]
@@ -1234,6 +1778,35 @@ mod tests {
         assert_eq!(hits[0].memory_id, "two");
         assert_ne!(hits[0].memory_id, hits[1].memory_id);
         assert!(hits.iter().all(|hit| !hit.changed_since_search));
+    }
+
+    #[test]
+    fn lexical_search_matches_inflected_forms_through_stemming() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().join("store"))).unwrap();
+        write_snapshot(
+            &paths,
+            vec![document(
+                temp.path().join("one.md"),
+                "one",
+                "Deploy notes",
+                100,
+                &[("a", "the schema migrations were applied by hand")],
+            )],
+        );
+        let search = |query: &str| {
+            search_memory(
+                &paths,
+                &MemorySearchOptions {
+                    query: query.to_string(),
+                    ..MemorySearchOptions::default()
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(search("migration").len(), 1);
+        assert_eq!(search("deploying").len(), 1);
+        assert_eq!(search("rollback").len(), 0);
     }
 
     #[test]
@@ -1472,6 +2045,155 @@ mod tests {
     }
 
     #[test]
+    fn memory_embeddings_reuse_text_across_snapshot_changes() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().join("store"))).unwrap();
+        let mut doc = document(
+            temp.path().join("one.md"),
+            "one",
+            "alpha",
+            100,
+            &[("first", "unchanged text"), ("second", "old text")],
+        );
+        write_snapshot(&paths, vec![doc.clone()]);
+        let mut seen = Vec::new();
+        let mut encode = |texts: &[&str]| -> Result<Vec<Vec<f32>>> {
+            seen.extend(texts.iter().map(|text| text.to_string()));
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    let mut embedding = vec![0.0; 384];
+                    embedding[0] = text.len() as f32;
+                    embedding[1] = 1.0;
+                    embedding
+                })
+                .collect())
+        };
+        assert_eq!(
+            embed_memory_with(&paths, ModelChoice::BGESmall, &mut encode).unwrap(),
+            2
+        );
+        let old_snapshot = MemoryStore::new(memory_snapshot_path(&paths))
+            .load()
+            .unwrap();
+        let old_path = memory_vector_path(&paths, &snapshot_fingerprint(&old_snapshot));
+
+        // Changing the document version also changes IDs for its unchanged sections.
+        doc.version_sha256 = "edited".into();
+        doc.sections[1].content = "new text".into();
+        write_snapshot(&paths, vec![doc.clone()]);
+        assert_eq!(
+            embed_memory_with(&paths, ModelChoice::BGESmall, &mut encode).unwrap(),
+            1
+        );
+        assert_eq!(seen, ["unchanged text", "old text", "new text"]);
+        let snapshot = MemoryStore::new(memory_snapshot_path(&paths))
+            .load()
+            .unwrap();
+        let vector = VectorIndex::open(&memory_vector_path(
+            &paths,
+            &snapshot_fingerprint(&snapshot),
+        ))
+        .unwrap();
+        validate_vector_inventory(&vector, &all_searchable_sections(&snapshot).unwrap()).unwrap();
+        let old_vector = VectorIndex::open(&old_path).unwrap();
+        validate_vector_inventory(
+            &old_vector,
+            &all_searchable_sections(&old_snapshot).unwrap(),
+        )
+        .unwrap();
+
+        // Renaming, deleting, and duplicating sections require no model initialization.
+        doc.version_sha256 = "rearranged".into();
+        doc.sections.remove(1);
+        doc.sections[0].id = "renamed".into();
+        let mut duplicate = doc.sections[0].clone();
+        duplicate.id = "duplicate".into();
+        doc.sections.push(duplicate);
+        write_snapshot(&paths, vec![doc]);
+        assert_eq!(
+            embed_memory_with(&paths, ModelChoice::BGESmall, |_| panic!("cached text")).unwrap(),
+            0
+        );
+        let snapshot = MemoryStore::new(memory_snapshot_path(&paths))
+            .load()
+            .unwrap();
+        let vector_path = memory_vector_path(&paths, &snapshot_fingerprint(&snapshot));
+        let vector = VectorIndex::open(&vector_path).unwrap();
+        let candidates = all_searchable_sections(&snapshot).unwrap();
+        validate_vector_inventory(&vector, &candidates).unwrap();
+        let mut query = vec![0.0; 384];
+        query[0] = "unchanged text".len() as f32;
+        query[1] = 1.0;
+        let hits = vector.search(&query, 2).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|(_, distance)| distance.abs() < 1e-5));
+
+        // Reconstructing the published index also uses the persisted cache.
+        fs::remove_dir_all(&vector_path).unwrap();
+        assert_eq!(
+            embed_memory_with(&paths, ModelChoice::BGESmall, |_| panic!("persisted cache"))
+                .unwrap(),
+            0
+        );
+        let mut inputs = 0;
+        assert_eq!(
+            embed_memory_with(&paths, ModelChoice::MiniLM, |texts| {
+                inputs += texts.len();
+                Ok(vec![query.clone(); texts.len()])
+            })
+            .unwrap(),
+            2
+        );
+        assert_eq!(inputs, 2, "different models must never share embeddings");
+    }
+
+    #[test]
+    fn interrupted_memory_embedding_reuses_completed_batches() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().join("store"))).unwrap();
+        let text = (0..65)
+            .map(|i| (format!("section-{i}"), format!("text-{i}")))
+            .collect::<Vec<_>>();
+        let sections = text
+            .iter()
+            .map(|(id, text)| (id.as_str(), text.as_str()))
+            .collect::<Vec<_>>();
+        let doc = document(temp.path().join("one.md"), "one", "alpha", 100, &sections);
+        write_snapshot(&paths, vec![doc]);
+        let mut calls = 0;
+        let result = embed_memory_with(&paths, ModelChoice::BGESmall, |texts| {
+            calls += 1;
+            if calls == 2 {
+                bail!("interrupted");
+            }
+            Ok(vec![vec![1.0; 384]; texts.len()])
+        });
+        assert!(result.unwrap_err().to_string().contains("interrupted"));
+        let snapshot = MemoryStore::new(memory_snapshot_path(&paths))
+            .load()
+            .unwrap();
+        let vector_path = memory_vector_path(&paths, &snapshot_fingerprint(&snapshot));
+        assert!(
+            !VectorIndex::exists(&vector_path),
+            "partial snapshots must not be published"
+        );
+        assert_eq!(
+            embed_memory_with(&paths, ModelChoice::BGESmall, |texts| {
+                assert_eq!(texts, ["text-64"]);
+                Ok(vec![vec![1.0; 384]])
+            })
+            .unwrap(),
+            1
+        );
+        validate_vector_inventory(
+            &VectorIndex::open(&vector_path).unwrap(),
+            &all_searchable_sections(&snapshot).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn existing_complete_vector_snapshot_skips_model_initialization() {
         let temp = TempDir::new().unwrap();
         let paths = Paths::new(Some(temp.path().join("store"))).unwrap();
@@ -1482,7 +2204,7 @@ mod tests {
             100,
             &[("section", "vector content")],
         );
-        write_snapshot(&paths, vec![doc]);
+        write_snapshot(&paths, vec![doc.clone()]);
         let snapshot = MemoryStore::new(memory_snapshot_path(&paths))
             .load()
             .unwrap();
@@ -1494,6 +2216,16 @@ mod tests {
 
         assert_eq!(
             embed_memory(&paths, ModelChoice::Potion, &EmbedRuntimeConfig::default()).unwrap(),
+            0
+        );
+        let mut updated = doc;
+        updated.version_sha256 = "metadata-only change".into();
+        write_snapshot(&paths, vec![updated]);
+        assert_eq!(
+            embed_memory_with(&paths, ModelChoice::Potion, |_| panic!(
+                "reuse legacy vector"
+            ))
+            .unwrap(),
             0
         );
     }

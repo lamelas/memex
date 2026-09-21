@@ -40,6 +40,9 @@ enum TranscriptPresentation {
     /// These are transport markers, not arbitrary XML or Markdown directives. Keep
     /// examples in Markdown code/quotes intact and retain the complete source in rawJSON.
     private static func assistantDisplayText(_ text: String) -> String {
+        // Most messages contain no transport markers. Avoid scanning every
+        // Markdown code span again whenever an earlier page is inserted.
+        guard text.contains(":codex-annotation") || text.contains("<oai-mem-citation>") else { return text }
         let source = text as NSString
         let protected = protectedMarkdownRanges(text)
         func isProtected(_ range: NSRange) -> Bool {
@@ -214,6 +217,13 @@ enum TranscriptPresentation {
             work = []
         }
         for entry in records {
+            // Keep completion evidence and turn boundaries for grouping without
+            // presenting routine Codex bookkeeping as conversation messages.
+            if entry.record.isRoutineTurnBoundary {
+                flushWork()
+                flushOrdinary()
+                continue
+            }
             if isWork(entry) {
                 flushOrdinary()
                 if work.first?.record.sourceTurnID != entry.record.sourceTurnID { flushWork() }

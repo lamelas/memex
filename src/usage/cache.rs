@@ -378,7 +378,7 @@ impl UsageCache {
                  DELETE FROM usage_fact_files WHERE source = OLD.source AND path = OLD.path;
              END;",
         )?;
-        if event_format != 1 || current_columns < 2 {
+        if event_format != 2 || current_columns < 2 {
             connection.execute("DELETE FROM usage_fact_sync", [])?;
         }
         // A blob update is not a facts update. Invalidate in the same SQLite
@@ -1045,7 +1045,7 @@ mod tests {
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            1
+            2
         );
     }
 

@@ -453,6 +453,7 @@ mod tests {
             "--no-antigravity",
             "--no-bob",
             "--no-zcode",
+            "--no-kiro",
         ]);
         assert_eq!(
             selected.source.as_deref(),

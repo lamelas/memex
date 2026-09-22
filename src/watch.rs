@@ -933,6 +933,7 @@ mod tests {
         options.include_antigravity = false;
         options.include_bob = false;
         options.include_zcode = false;
+        options.include_kiro = false;
         let roots = watch_roots(&options);
         assert_eq!(roots, options.claude_sources);
     }

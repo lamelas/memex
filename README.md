@@ -72,8 +72,9 @@ tool. **Import into** creates a conversation in another tool using the
 | Antigravity | Yes | No | Yes | No | No |
 | IBM Bob | Yes | Yes | Yes | No | No |
 | ZCode | Yes | Yes | No | No | No |
+| KiloCode CLI | Yes | Yes | Yes | No | No |
 | Kiro CLI | Yes | Credits only | No | No | No |
-| Hermes | No | Yes | No | No | No |
+| Hermes | Yes | Yes | No | No | No |
 
 - **History coverage depends on the local records a tool saves.** Cursor history
   comes from agent transcripts; its usage data comes from local databases.
@@ -82,9 +83,12 @@ tool. **Import into** creates a conversation in another tool using the
   ZCode reads `~/.zcode/cli/db/db.sqlite`, which its SSH-attached runtimes also
   write on remote hosts; `ZCODE_HOME` (comma-separated) indexes extra stores.
   Kiro reads `~/.kiro/sessions`; set `KIRO_SESSIONS_DIR` for copied sessions.
+  KiloCode CLI reads `~/.local/share/kilo/kilo.db` (`$XDG_DATA_HOME/kilo/kilo.db`);
+  set `KILO_DATA_DIR` (comma-separated) to index extra stores.
 - **Token usage is opt-in and depends on recorded counters.** Cost estimates are
-  not subscription charges or quota balances. Hermes support reads usage counters
-  and metadata only, not message content. Copilot usage requires local OpenTelemetry
+  not subscription charges or quota balances. Hermes history and usage are read from
+  its local `state.db`; plaintext reasoning is indexed only with `--include-reasoning`.
+  Copilot usage requires local OpenTelemetry
   export files; session transcripts alone do not supply its usage data.
   Kiro reports credits separately because its records do not contain token counts or costs.
 - **Resume uses per-engine commands**, configurable in Memex. Cursor uses
@@ -167,7 +171,10 @@ memex search "how we handled retries" --mode hybrid --format text
 
 See [search and reading](docs/search.md) for filters, output formats, pagination,
 reasoning inclusion, and memory retrieval; see [embeddings and configuration](docs/configuration.md)
-for models and CPU, CoreML, or CUDA execution.
+for models and CPU, CoreML, or CUDA execution. Embeddings can also come from an
+OpenAI-compatible API such as OpenAI or Ollama; see
+[remote embeddings](docs/configuration.md#remote-embeddings). Remote embeddings send
+transcript text and memory documents to that API.
 
 ## Agent integration
 

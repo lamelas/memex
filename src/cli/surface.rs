@@ -38,10 +38,17 @@ pub(super) enum IndexCommand {
         #[arg(long)]
         root: Option<PathBuf>,
     },
-    /// Show index statistics and storage paths
+    /// Show index statistics, vector state, and indexing config
+    #[command(
+        after_help = "EXAMPLES:\n    memex index stats\n    memex index stats --format json --pretty"
+    )]
     Stats {
+        #[arg(long, hide = true)]
+        json: bool,
         #[arg(long)]
         root: Option<PathBuf>,
+        #[command(flatten)]
+        output: OutputArgs,
     },
 }
 
@@ -88,12 +95,53 @@ pub(super) enum SessionCommand {
 pub(super) enum DebugCommand {
     /// Evaluate retrieval with a JSONL dataset
     EvalRetrieval {
-        dataset: PathBuf,
-        #[arg(long, default_value_t = 20)]
-        k: usize,
-        #[arg(long)]
-        root: Option<PathBuf>,
+        #[command(flatten)]
+        evaluation: EvaluationArgs,
     },
+}
+
+#[derive(Debug, Clone, Args)]
+pub(super) struct EvaluationArgs {
+    /// JSONL queries with graded relevant records and optional evidence spans
+    pub(super) dataset: PathBuf,
+    /// Cutoff for ranking metrics
+    #[arg(long, default_value_t = 10)]
+    pub(super) k: usize,
+    /// Number of surfaced results to retrieve (must be at least k and 20)
+    #[arg(long, default_value_t = 20)]
+    pub(super) limit: usize,
+    /// Product search path to evaluate
+    #[arg(long, value_enum, default_value = "cli")]
+    pub(super) surface: EvaluationSurface,
+    #[arg(long, value_enum, default_value = "lexical")]
+    pub(super) mode: CliSearchMode,
+    /// Disable time-dependent scoring by default for reproducible baselines
+    #[arg(long, default_value_t = 0.0)]
+    pub(super) recency_weight: f32,
+    #[arg(long, default_value_t = 30.0)]
+    pub(super) recency_half_life_days: f32,
+    #[arg(long, value_enum, default_value = "regular")]
+    pub(super) origin: super::SessionOrigin,
+    /// Evaluate the CLI's conversation-diverse result list
+    #[arg(long)]
+    pub(super) unique_session: bool,
+    /// Seed an isolated temporary index from portable Record JSONL
+    #[arg(long, conflicts_with = "root")]
+    pub(super) records: Option<PathBuf>,
+    /// Compare against a saved evaluation report; fail on per-query quality regressions
+    #[arg(long)]
+    pub(super) baseline: Option<PathBuf>,
+    /// Existing Memex root; evaluation never refreshes the index
+    #[arg(long)]
+    pub(super) root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum EvaluationSurface {
+    Cli,
+    Tui,
+    Web,
 }
 
 impl Commands {
@@ -115,7 +163,7 @@ impl Commands {
                 },
                 IndexCommand::Compact { root } => Self::IndexCompact { root },
                 IndexCommand::Embed { model, root } => Self::Embed { model, root },
-                IndexCommand::Stats { root } => Self::Stats { root },
+                IndexCommand::Stats { json, root, output } => Self::Stats { json, root, output },
             },
             Self::Web {
                 action: Some(action),
@@ -179,12 +227,14 @@ pub(super) enum IndexSource {
     Openclaw,
     Copilot,
     Grok,
+    Hermes,
     Jcode,
     Muse,
     Antigravity,
     Bob,
     Zcode,
     Kiro,
+    Kilocode,
 }
 
 impl IndexArgs {
@@ -199,12 +249,14 @@ impl IndexArgs {
             IndexSource::Openclaw => self.openclaw && !self.no_openclaw,
             IndexSource::Copilot => self.copilot && !self.no_copilot,
             IndexSource::Grok => self.grok && !self.no_grok,
+            IndexSource::Hermes => self.hermes && !self.no_hermes,
             IndexSource::Jcode => self.jcode && !self.no_jcode,
             IndexSource::Muse => self.muse && !self.no_muse,
             IndexSource::Antigravity => self.antigravity && !self.no_antigravity,
             IndexSource::Bob => self.bob && !self.no_bob,
             IndexSource::Zcode => self.zcode && !self.no_zcode,
             IndexSource::Kiro => self.kiro && !self.no_kiro,
+            IndexSource::Kilocode => self.kilocode && !self.no_kilocode,
         };
         legacy_enabled
             && (self.only_source.is_empty() || self.only_source.contains(&source))
@@ -448,12 +500,14 @@ mod tests {
             "--no-openclaw",
             "--no-copilot",
             "--no-grok",
+            "--no-hermes",
             "--no-jcode",
             "--no-muse",
             "--no-antigravity",
             "--no-bob",
             "--no-zcode",
             "--no-kiro",
+            "--no-kilocode",
         ]);
         assert_eq!(
             selected.source.as_deref(),

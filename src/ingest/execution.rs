@@ -106,6 +106,40 @@ pub(super) fn parse_kiro_file(
     )
 }
 
+pub(super) fn parse_hermes_file(
+    task: &FileTask,
+    include_reasoning: bool,
+    tx_record: &RecordSender,
+    tx_update: &Sender<FileUpdate>,
+    next_doc_id: &AtomicU64,
+    progress: &Arc<Progress>,
+) -> Result<()> {
+    let source_path = task.path.to_string_lossy().to_string();
+    let parsed = crate::sources::hermes::parse_index_records(
+        &task.path,
+        crate::sources::IndexParseState {
+            offset: task.offset,
+            turn_id: task.turn_id,
+            legacy_turn_id: task.legacy_turn_id,
+            pending_tool_calls: task.pending_tool_calls.clone(),
+        },
+        include_reasoning,
+        next_doc_id,
+        |record| {
+            progress.add_produced(SourceKind::Hermes, 1);
+            tx_record.send(record)
+        },
+    )?;
+    finish_source_parse(
+        task,
+        tx_update,
+        progress,
+        SourceKind::Hermes,
+        source_path,
+        parsed,
+    )
+}
+
 pub(super) fn parse_zcode_file(
     task: &FileTask,
     include_reasoning: bool,
@@ -135,6 +169,40 @@ pub(super) fn parse_zcode_file(
         tx_update,
         progress,
         SourceKind::Zcode,
+        source_path,
+        parsed,
+    )
+}
+
+pub(super) fn parse_kilocode_file(
+    task: &FileTask,
+    include_reasoning: bool,
+    tx_record: &RecordSender,
+    tx_update: &Sender<FileUpdate>,
+    next_doc_id: &AtomicU64,
+    progress: &Arc<Progress>,
+) -> Result<()> {
+    let source_path = task.path.to_string_lossy().to_string();
+    let parsed = crate::sources::kilocode::parse_index_records(
+        &task.path,
+        crate::sources::IndexParseState {
+            offset: task.offset,
+            turn_id: task.turn_id,
+            legacy_turn_id: task.legacy_turn_id,
+            pending_tool_calls: task.pending_tool_calls.clone(),
+        },
+        include_reasoning,
+        next_doc_id,
+        |record| {
+            progress.add_produced(SourceKind::Kilocode, 1);
+            tx_record.send(record)
+        },
+    )?;
+    finish_source_parse(
+        task,
+        tx_update,
+        progress,
+        SourceKind::Kilocode,
         source_path,
         parsed,
     )
@@ -646,7 +714,7 @@ pub(super) fn flush_embeddings(
     let items: Vec<(u64, String, SourceKind)> = buffer
         .drain(..)
         .map(|(doc_id, text, source)| (doc_id, truncate_for_embedding(text), source))
-        .filter(|(_, text, _)| !text.is_empty())
+        .filter(|(_, text, _)| !text.trim().is_empty())
         .collect();
 
     if items.is_empty() {
@@ -880,7 +948,14 @@ impl ParserContext<'_> {
                     self.next_id,
                     self.progress,
                 ),
-                SourceKind::Hermes => Err(anyhow!("Hermes indexing is not supported")),
+                SourceKind::Hermes => parse_hermes_file(
+                    task,
+                    self.options.include_reasoning,
+                    self.records,
+                    self.updates,
+                    self.next_id,
+                    self.progress,
+                ),
                 SourceKind::Jcode => parse_jcode_file(
                     task,
                     self.options.include_reasoning,
@@ -913,6 +988,14 @@ impl ParserContext<'_> {
                     self.progress,
                 ),
                 SourceKind::Zcode => parse_zcode_file(
+                    task,
+                    self.options.include_reasoning,
+                    self.records,
+                    self.updates,
+                    self.next_id,
+                    self.progress,
+                ),
+                SourceKind::Kilocode => parse_kilocode_file(
                     task,
                     self.options.include_reasoning,
                     self.records,
@@ -1207,8 +1290,12 @@ pub(super) fn refresh_memories(
             "ingest-memory-vectors",
             crate::lease::INGEST_LEASE_TIMEOUT,
         )?;
-        let count =
-            crate::memory_search::embed_memory(paths, options.model, &options.embed_runtime)?;
+        let count = crate::memory_search::embed_memory(
+            paths,
+            &options.model,
+            &options.embed_runtime,
+            None,
+        )?;
         if count > 0 {
             eprintln!("memory index: embedded {count} sections");
         }
@@ -1314,7 +1401,7 @@ pub(super) fn execute_refresh(
         });
     }
 
-    let mut vector_migration = vector_migration(&paths.vectors, &tasks, options.model);
+    let mut vector_migration = vector_migration(&paths.vectors, &tasks, &options.model);
     if recover_embeddings
         && !options.embeddings
         && crate::vector::VectorIndex::exists(&paths.vectors)
@@ -1324,7 +1411,28 @@ pub(super) fn execute_refresh(
     {
         vector_migration.model = model;
     }
-    let embeddings = options.embeddings || vector_migration.rebuild || recover_embeddings;
+    let mut embedding_recovery = recover_embeddings;
+    if vector_migration.model.is_remote() && options.embed_runtime.remote.is_none() {
+        if options.embeddings {
+            // The configured local model replaces the remote vectors.
+            vector_migration.model = options.model.clone();
+        } else {
+            static REMOTE_VECTORS_WARNING: std::sync::Once = std::sync::Once::new();
+            REMOTE_VECTORS_WARNING.call_once(|| {
+                eprintln!(
+                    "warning: vectors use remote embedding model {}, which cannot be maintained \
+                     without a remote endpoint; skipping embedding",
+                    vector_migration.model.identity()
+                );
+            });
+            // Re-parsed and deleted files still lose their vectors through
+            // `vector_delete_paths`, and their records get new doc IDs, so no stale
+            // vector stays reachable; `memex embed` with an endpoint fills the gap.
+            vector_migration.rebuild = false;
+            embedding_recovery = false;
+        }
+    }
+    let embeddings = options.embeddings || vector_migration.rebuild || embedding_recovery;
     let vector_publication = embeddings
         || reconcile_pending_vector_ids
         || ((recover_vector_cleanup
@@ -1394,7 +1502,7 @@ pub(super) fn execute_refresh(
         embeddings,
         do_backfill_embeddings: options.backfill_embeddings
             || vector_migration.rebuild
-            || recover_embeddings
+            || embedding_recovery
             || (embeddings && vector_work),
         reset_vector_store: vector_migration.rebuild,
         vector_dir: paths.vectors.clone(),

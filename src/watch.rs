@@ -122,8 +122,6 @@ pub(crate) struct WatchStats {
 /// Compute the exact directory set that transcript discovery walks, so the
 /// watcher covers every source `ingest_all` reads — and nothing else.
 ///
-/// Sources without an ingest discovery block (Hermes) are deliberately
-/// excluded; watching them could only trigger useless ingests.
 pub(crate) fn watch_roots(options: &IngestOptions) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if !options.claude_sources.is_empty() {
@@ -154,6 +152,9 @@ pub(crate) fn watch_roots(options: &IngestOptions) -> Vec<PathBuf> {
     if options.include_grok {
         roots.push(crate::sources::grok::root());
     }
+    if options.include_hermes {
+        roots.extend(crate::sources::hermes::watch_roots());
+    }
     if options.include_jcode {
         roots.push(crate::sources::jcode::sessions_root());
     }
@@ -171,6 +172,9 @@ pub(crate) fn watch_roots(options: &IngestOptions) -> Vec<PathBuf> {
     }
     if options.include_zcode {
         roots.extend(crate::sources::zcode::db_dirs());
+    }
+    if options.include_kilocode {
+        roots.extend(crate::sources::kilocode::db_dirs());
     }
     roots.sort();
     roots.dedup();
@@ -220,6 +224,8 @@ fn interesting_event_paths(event: &Event, excluder: &PathExcluder) -> (Vec<PathB
                 crate::sources::opencode::is_database_path(name)
                     || crate::sources::bob::is_configured_database(&database)
                     || crate::sources::zcode::db_paths().contains(&database)
+                    || crate::sources::kilocode::db_paths().contains(&database)
+                    || crate::sources::hermes::is_configured_database(&database)
                     || (crate::sources::antigravity::is_db_path(&database)
                         && crate::sources::antigravity::matches_path(&database.to_string_lossy()))
             })
@@ -415,11 +421,13 @@ pub(crate) fn sweep_candidates(
         file.identity.sqlite_wal.is_none()
             && file.identity.bob_database.is_none()
             && file.identity.zcode_database.is_none()
+            && file.identity.kilocode_database.is_none()
             && !databases.contains(key)
             && !crate::sources::bob::matches_path(key)
     });
     databases.extend(reader.bob_database_paths()?);
     databases.extend(reader.zcode_database_paths()?);
+    databases.extend(reader.kilocode_database_paths()?);
     Ok((snapshot, databases))
 }
 
@@ -731,12 +739,13 @@ impl WatchService {
             let reader = CheckpointReader::open(&paths.state.join("ingest.json"))?;
             sweep_candidates(&reader, cutoff)?
         };
-        // A Bob/ZCode database with no indexed session yet has no state key; seed it
+        // A Bob/ZCode/KiloCode database with no indexed session yet has no state key; seed it
         // from the configuration whenever this daemon watches its directory, so the first
         // commits through a held-open WAL are noticed too.
         for database in crate::sources::bob::database_paths()
             .into_iter()
             .chain(crate::sources::zcode::db_paths())
+            .chain(crate::sources::kilocode::db_paths())
         {
             if database.is_file()
                 && crate::sources::bob::canonical_alias(&database)
@@ -793,7 +802,6 @@ mod tests {
     use crate::config::UserConfig;
     use crate::state::{FileIdentity, FileState, IngestState};
     use crate::test_support::{EnvVarGuard, env_lock};
-    use crossbeam_channel::unbounded;
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
     use std::path::Path;
@@ -811,11 +819,13 @@ mod tests {
             include_openclaw: true,
             include_copilot: true,
             include_grok: true,
+            include_hermes: true,
             include_jcode: true,
             include_muse: true,
             include_antigravity: true,
             include_bob: true,
             include_zcode: true,
+            include_kilocode: true,
             include_kiro: true,
             exclude_patterns: Vec::new(),
             embeddings: false,
@@ -928,11 +938,13 @@ mod tests {
         options.include_openclaw = false;
         options.include_copilot = false;
         options.include_grok = false;
+        options.include_hermes = false;
         options.include_jcode = false;
         options.include_muse = false;
         options.include_antigravity = false;
         options.include_bob = false;
         options.include_zcode = false;
+        options.include_kilocode = false;
         options.include_kiro = false;
         let roots = watch_roots(&options);
         assert_eq!(roots, options.claude_sources);
@@ -992,6 +1004,54 @@ mod tests {
             &excluder,
         );
         assert_eq!(paths.len(), 1);
+    }
+
+    #[test]
+    fn hermes_wal_events_use_configured_roots_and_exclusions() {
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("custom-hermes");
+        std::fs::create_dir_all(&root).unwrap();
+        let _env = EnvVarGuard::set_os(&[("HERMES_PROFILE_ROOTS", Some(root.as_os_str()))]);
+        let mut options = test_options();
+        for relative in ["state.db", "profiles/work/state.db"] {
+            let database = root.join(relative);
+            let wal = database.with_file_name("state.db-wal");
+            let event = Event {
+                kind: EventKind::Modify(notify::event::ModifyKind::Any),
+                paths: vec![wal.clone()],
+                attrs: Default::default(),
+            };
+            options.exclude_patterns.clear();
+            let excluder = watch_excluder(&options).unwrap();
+            assert_eq!(
+                interesting_event_paths(&event, &excluder).0,
+                vec![database.clone()]
+            );
+            for excluded in [&database, &wal] {
+                options.exclude_patterns = vec![excluded.to_string_lossy().into_owned()];
+                let excluder = watch_excluder(&options).unwrap();
+                assert!(interesting_event_paths(&event, &excluder).0.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn hermes_database_file_watch_root_covers_its_wal() {
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("state.db");
+        std::fs::write(&database, b"").unwrap();
+        let _env = EnvVarGuard::set_os(&[("HERMES_PROFILE_ROOTS", Some(database.as_os_str()))]);
+        let options = test_options();
+        assert!(watch_roots(&options).contains(&temp.path().to_path_buf()));
+        let event = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Any),
+            paths: vec![database.with_file_name("state.db-wal")],
+            attrs: Default::default(),
+        };
+        let excluder = watch_excluder(&options).unwrap();
+        assert_eq!(interesting_event_paths(&event, &excluder).0, vec![database]);
     }
 
     #[test]
@@ -1246,7 +1306,7 @@ mod tests {
         let probe = root.join("ready.txt");
         std::fs::write(&target, "x").expect("seed");
         std::fs::write(&probe, "").expect("probe");
-        let (tx, rx) = unbounded::<notify::Result<Event>>();
+        let (tx, rx) = crossbeam_channel::unbounded::<notify::Result<Event>>();
         let mut watcher = RecommendedWatcher::new(
             move |result| {
                 let _ = tx.send(result);
@@ -1399,6 +1459,7 @@ mod tests {
                 source_metadata_sha256: None,
                 bob_database: None,
                 zcode_database: None,
+                kilocode_database: None,
                 sqlite_wal: None,
                 device: None,
                 inode: None,

@@ -42,6 +42,12 @@ memex daemon disable
 The daemon reads config defaults for its mode, interval, listeners, and log paths.
 Flags override those defaults.
 
+If an index has an incompatible schema or term dictionary format, continuous indexing
+logs the recovery error once and stays paused without retrying or exiting into a service
+manager restart loop. The daemon remains running but is not ready. Repair or explicitly
+rebuild the index, then run `memex daemon restart` to resume indexing. An installed
+executable update can still activate while indexing is paused.
+
 ### Resumable embeddings
 
 When embeddings are enabled, continuous indexing runs background backfills in a supervised
@@ -56,8 +62,13 @@ those batches. The active vector generation stays searchable until its replaceme
 
 The daemon stops and reaps its child on shutdown, embedding-configuration changes, and
 executable handoff. `--no-embeddings` disables its worker. Explicit index rebuilds discard
-embedding checkpoints along with the derived indexes. Changing embedding models discards
-incompatible checkpoint vectors; embeddings cannot be reused between models.
+embedding checkpoints along with the derived indexes. Changing the embedding model, or
+setting or changing `embedding_dimensions`, re-creates the embeddings and discards
+incompatible checkpoint vectors; embeddings cannot be reused between models or sizes. The
+daemon does not notice when `embedding_dimensions` is removed for a remote model or when a
+provider changes its vector size; run `memex embed` once to rebuild. Changing remote
+embedding settings, such as the base URL, API key, timeout, or retries, restarts the embed
+worker. A failing embed worker is restarted with exponential backoff of up to 5 minutes.
 
 ### Reclaiming obsolete index generations
 

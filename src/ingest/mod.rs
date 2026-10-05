@@ -50,7 +50,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-const EMBED_BATCH_SIZE: usize = 64;
 const EMBED_MAX_CHARS: usize = 8192;
 const RETAINED_HEAD_PERCENT: usize = 75;
 const INDEX_PROGRESS_BATCH: u64 = 1;
@@ -70,11 +69,13 @@ pub struct IngestOptions {
     pub include_openclaw: bool,
     pub include_copilot: bool,
     pub include_grok: bool,
+    pub include_hermes: bool,
     pub include_jcode: bool,
     pub include_muse: bool,
     pub include_antigravity: bool,
     pub include_bob: bool,
     pub include_zcode: bool,
+    pub include_kilocode: bool,
     pub include_kiro: bool,
     pub exclude_patterns: Vec<String>,
     pub embeddings: bool,
@@ -207,7 +208,7 @@ enum WriterOutcome {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct VectorMigration {
     rebuild: bool,
     model: ModelChoice,

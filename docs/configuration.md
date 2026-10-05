@@ -12,9 +12,21 @@ memex index --embeddings
 Recommended when embeddings are on (especially non-`potion` models): run the background
 daemon with `memex daemon enable --continuous`, and consider setting `auto_index_on_search = false`
 to keep searches fast.
+
+The `embeddings` config key selects the backend:
+
+| Value | Meaning |
+|-------|---------|
+| `false` | Embeddings off |
+| `true` or `"local"` | Local fastembed or model2vec model |
+| `"remote"` | OpenAI-compatible HTTP API (see [Remote embeddings](#remote-embeddings)) |
+
+Changing the model (or, for remote, `embedding_dimensions`) re-embeds on the next `memex index`,
+`memex embed`, or daemon embed cycle. Vectors from different models or sizes are never mixed.
 ## Embedding model
 
-Select via `--model` flag or `MEMEX_MODEL` env var:
+Select via `--model` flag or `MEMEX_MODEL` env var. For local embeddings, the value is one
+of these aliases:
 
 | Model | Dims | Speed | Quality |
 |-------|------|-------|---------|
@@ -29,6 +41,55 @@ memex index --model minilm
 # or
 MEMEX_MODEL=minilm memex index
 ```
+
+or any fastembed model name, matched case-insensitively against the `EmbeddingModel`
+variant names, such as `BGELargeENV15` or `multilinguale5base`. See
+[fastembed's `EmbeddingModel` list](https://docs.rs/fastembed/5.17.4/fastembed/enum.EmbeddingModel.html)
+for the catalog; an unknown name fails with the list of supported models. Each local model
+produces its native vector size.
+## Remote embeddings
+
+With `embeddings = "remote"`, memex computes embeddings with any OpenAI-compatible
+server (OpenAI, Ollama, vLLM, LM Studio, LiteLLM).
+`model`, `MEMEX_MODEL`, or `--model` names the remote model, passed verbatim.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `model` | none | Remote model name; required |
+| `embedding_base_url` | none | `http` or `https` API base URL; required |
+| `embedding_api_key` | none | Literal API key |
+| `embedding_api_key_env` | none | Variable holding the API key |
+| `embedding_dimensions` | model default | API `dimensions` parameter (up to 65536); remote only |
+| `embedding_batch_size` | 64 | Texts per request (1 to 2048); local too |
+| `embedding_timeout_secs` | 60 | Per-attempt timeout in seconds (1 to 600) |
+| `embedding_max_retries` | 3 | Retries on 429, 5xx, timeouts, and connection errors (0 to 10) |
+
+The key is `embedding_api_key`, else only the variable named by `embedding_api_key_env`, else
+`MEMEX_EMBEDDING_API_KEY`, then `OPENAI_API_KEY` (sent to any host); with no key, no
+`Authorization` header is sent. `execution_provider`, `compute_units`, and `cuda_*` are ignored
+in remote mode; the URL, key, timeout, and retry keys are ignored in local mode.
+
+```toml
+embeddings = "remote"
+model = "text-embedding-3-small"
+embedding_base_url = "https://api.openai.com/v1"
+```
+
+```toml
+embeddings = "remote"
+model = "nomic-embed-text"
+embedding_base_url = "http://localhost:11434/v1"  # Ollama
+```
+
+A startup probe sets or checks the vector size, and every response is checked against it.
+A server that starts returning a different size is detected by `memex embed`, not by the
+daemon. Switching provider with the same model name and size is not detected; run
+`memex embed` after such a switch.
+
+memex sends transcript text (user and assistant messages, each truncated to 8192 bytes) and
+memory documents to the endpoint. Plain `http://` to a non-loopback host is rejected when a
+key is set and warned about otherwise; `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` are
+honored.
 ## Execution provider
 
 Select via `execution_provider` in config or `MEMEX_EXECUTION_PROVIDER`:
@@ -54,11 +115,18 @@ keys.
 Create `~/.memex/config.toml` (or `<root>/config.toml` if you use `--root`):
 
 ```toml
-embeddings = true
+embeddings = true  # true or "local", "remote", false
 auto_index_on_search = true
 include_reasoning = false  # opt in to plaintext reasoning; encrypted/redacted payloads stay excluded
 token_usage = false  # opt in to local token and cost tracking
-model = "minilm"  # minilm, bge, nomic, gemma, potion
+model = "minilm"  # local: minilm, bge, nomic, gemma, potion, or a fastembed model name; remote: API model name
+embedding_batch_size = 64  # local and remote
+# embedding_dimensions = 512  # remote only
+# embedding_base_url = "https://api.openai.com/v1"  # remote only
+# embedding_api_key_env = "OPENAI_API_KEY"  # remote only; default MEMEX_EMBEDDING_API_KEY, then OPENAI_API_KEY
+# embedding_api_key = "sk-..."  # remote only; takes precedence over embedding_api_key_env
+embedding_timeout_secs = 60  # remote only; 1 to 600
+embedding_max_retries = 3  # remote only; 0 to 10
 execution_provider = "auto"  # auto, cpu, coreml, cuda
 cuda_device_id = 0  # optional, when execution_provider = "cuda"
 cuda_library_paths = ["/usr/local/cuda/lib64"]  # optional list of CUDA library dirs
@@ -109,7 +177,7 @@ new limits to records that are already indexed.
 matched transcripts never enter the index (a leading `~/` is expanded to your home directory).
 Adding a pattern also removes records previously indexed from matched paths — no rebuild
 required. For one-off runs, pass `--exclude GLOB` (repeatable) to `memex index`.
-`execution_provider` applies to ONNX-backed models; `potion` uses the model2vec backend.
+`execution_provider` applies to local ONNX-backed models; `potion` uses the model2vec backend.
 `cuda_library_paths` and `cudnn_library_paths` accept path lists and are only used
 when `execution_provider = "cuda"`.
 

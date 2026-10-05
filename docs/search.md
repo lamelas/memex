@@ -20,11 +20,97 @@ The main search, indexing, and maintenance commands are organized as follows:
 | Browser UI | `memex web serve`, `memex web open` (`memex web` also serves) |
 | Retrieval diagnostics | `memex debug eval-retrieval DATASET` |
 
+## Search quality evaluation
+
+Conversation relevance search favors matching user/assistant text over matching
+tool records. Ordinary unquoted multi-word queries also reward conversational
+records that cover the whole query, before the candidate limit is applied. Partial
+matches and tool evidence remain eligible. Explicit role/tool filters bypass these
+preferences; quoted phrases, Boolean operators and field syntax keep their match
+semantics. This applies to shared lexical retrieval used by CLI, TUI and web search.
+
+`debug eval-retrieval` evaluates the actual CLI result pipeline, including query
+fusion, filters, recency, conversation diversity and compact snippets. Evaluation
+never refreshes the index. The default is local lexical search with recency disabled
+for reproducibility, 20 returned results, and a metric cutoff of 10.
+
+```sh
+memex debug eval-retrieval cases.jsonl --root ~/.memex
+memex debug eval-retrieval cases.jsonl --root ~/.memex --unique-session
+memex debug eval-retrieval cases.jsonl --root ~/.memex --recency-weight 1
+```
+
+Each JSONL case specifies `id`, `query` (or `queries` for multiple views), optional
+`cwd`, optional `filters` (`project`, `source`, `role`, `session`, `since`, `until`),
+and a `relevant` array. Judgments identify a record by machine, source, session,
+source path, document ID and optionally stable `record_id`; they carry a graded
+`relevance` and optional verbatim `evidence` spans. Use grades 0–3 for noise,
+related context, useful evidence and direct answers. An empty relevant array is
+a deliberately judged no-answer query, not an unjudged query.
+
+Reports contain ranked record references and the **actual rendered snippets** for
+each query. They measure MRR@k, graded nDCG@k, known-positive recall@k and @20,
+success among the first five distinct conversations, expected evidence visible in
+snippets at k, and elapsed search time. No-answer accuracy is reported separately;
+positive ranking metrics are undefined for those cases. Aggregate means exclude
+undefined metrics. Recall is relative to the judged set, not exhaustive corpus
+recall; these metrics do not infer relevance from clicks or BM25 scores.
+
+To evaluate grouping and snippets in the terminal or browser interface, use
+`--surface tui` or `--surface web`. These wrappers call the existing UI search
+functions. Their datasets must contain one query per case and only project/source
+filters; unsupported CLI filters or tuning fail explicitly. Compare surfaces on
+the same supported subset. TUI evaluation uses its configured machine selection
+and repository grouping; web and CLI evaluation are local. Partial TUI federation
+failures invalidate the evaluation rather than quietly reduce its result set.
+Federated TUI reports record the selected machines, but baseline comparison is
+rejected until remote snapshot identities can be recorded too.
+
+Use `--records records.jsonl` instead of `--root` to build an isolated temporary
+index from portable Memex records. Judged record references and evidence must
+resolve in that corpus. Working-directory scopes require an existing root's
+analytics metadata and are rejected with `--records`; use project/session scopes
+for portable fixtures.
+Snapshot analytics uses only supplied record facts, without opening source files
+or discovering repositories on the host. Each record may include `repo_project`
+to preserve repository grouping; missing repository facts remain Unfiled.
+The temporary index is removed when the run finishes.
+
+```sh
+memex debug eval-retrieval cases.jsonl --records records.jsonl > baseline.json
+memex debug eval-retrieval cases.jsonl --records records.jsonl --baseline baseline.json
+```
+
+Baseline comparisons fail on **individual query** quality regressions. They
+require matching dataset/corpus hashes, cutoff and search configuration (including
+live index revision for an existing root). Reports flag local index changes during
+the run, and baseline comparisons reject such runs. Semantic/hybrid reports also
+identify the vector snapshot; evaluation fails if that snapshot changes or disappears
+around a search, and baselines require the same snapshot. Latency is reported but not used as a
+machine-dependent CI gate. Reports contain queries, paths and snippets: keep
+private evaluations outside tracked files.
+
+The checked-in [regression corpus](../tests/fixtures/retrieval-quality/README.md)
+uses wholly synthetic queries and passages. CI checks lexical CLI,
+TUI and web baselines, including known weak cases. It does not establish absolute
+quality over the user's full history. Review per-case diagnostics before updating
+a baseline; do not lower it just to make CI pass.
+
+Semantic/hybrid comparisons use `--mode semantic|hybrid` against a prepared root.
+They require nonempty vectors and a resolvable stored model; missing vectors cannot
+silently produce a lexical score labelled semantic. Keep corpus, stored model,
+model revision, embedding runtime and filters fixed when comparing modes. Reranking
+and query-expansion experiments need their own explicit configurations; neither
+is enabled by this evaluator.
+
 Index all supported sources by default. Use repeatable `--only-source <source>` or
 `--exclude-source <source>` options to select providers, and `--claude-path <path>`
 to use a non-default Claude projects directory. Index sources are `claude`, `codex`,
-`cursor`, `opencode`, `pi`, `omp`, `openclaw`, `copilot`, `grok`, `jcode`, `muse`,
-`antigravity`, `bob`, and `zcode`. Hermes supports usage tracking only.
+`cursor`, `opencode`, `pi`, `omp`, `openclaw`, `copilot`, `grok`, `hermes`, `jcode`,
+`muse`, `antigravity`, `bob`, `zcode`, and `kilocode`.
+Hermes transcripts and usage are read from `state.db` under `~/.hermes` and its
+named profiles; `HERMES_PROFILE_ROOTS` (comma-separated paths) selects alternate
+stores. Plaintext reasoning is indexed only with `--include-reasoning`.
 Bob tasks are read from `~/.bob/db/bob.db` (override with `MEMEX_BOB_DB`, a comma-separated
 list of database paths with any file name, `~/` expanded); each task is indexed under the
 virtual source path `<db>/<task_id>`, and sub-agent runs embedded in a task appear as their own
@@ -32,6 +118,11 @@ sessions. A database that cannot be read is skipped with a warning and its index
 ZCode sessions are read from `~/.zcode/cli/db/db.sqlite`, the store its SSH-attached
 agent runtimes also write on remote hosts; `ZCODE_HOME` (comma-separated state roots)
 adds extra stores, such as a synced copy from another machine.
+KiloCode CLI sessions are read from `~/.local/share/kilo/kilo.db`
+(`$XDG_DATA_HOME/kilo/kilo.db` when set); `KILO_DATA_DIR` (comma-separated state
+roots) adds extra stores. Subagent sessions are indexed under their own session id
+with the parent recorded, and token usage comes from the per-request counters each
+assistant message carries.
 
 ## Agent memories
 
@@ -152,6 +243,14 @@ TUI:
 memex tui
 ```
 
+Drag over visible text to select it; releasing the mouse sends the selection to
+your clipboard. Selection stays within the pane where the drag began. Normal
+clicks, scrolling, and dragging the split divider continue to work without a mode
+switch. Copying requires OSC 52 clipboard writes to be enabled in your terminal
+(and multiplexer, if used). Memex cannot confirm whether the terminal accepted
+the clipboard write. You can also use native terminal selection by holding Shift
+while dragging in Ghostty and most xterm-style terminals, or Option in iTerm2.
+
 Notes:
 - Embeddings are disabled by default. Pass `--embeddings` to generate them during indexing.
 - Searches run an incremental index refresh by default (configurable).
@@ -229,7 +328,7 @@ envelope. Its identifiers remain searchable through the `event_id` field.
 - `--role <user|assistant|tool_use|tool_result>`
 - `--tool <tool_name>`
 - `--session <session_id>`
-- `--source claude|codex|cursor|opencode|pi|omp|openclaw|copilot|grok|hermes|jcode|muse|antigravity|bob|zcode` (Hermes has no conversation records)
+- `--source claude|codex|cursor|opencode|pi|omp|openclaw|copilot|grok|hermes|jcode|muse|antigravity|bob|zcode|kilocode`
 - `--since <iso|unix>` / `--until <iso|unix>`
 - `--limit <n>`
 - `--min-score <float>`

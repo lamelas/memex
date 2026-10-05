@@ -48,11 +48,13 @@ fn ingest_options(embeddings: bool, model: ModelChoice) -> IngestOptions {
         include_openclaw: false,
         include_copilot: false,
         include_grok: false,
+        include_hermes: false,
         include_jcode: false,
         include_muse: false,
         include_antigravity: false,
         include_bob: false,
         include_zcode: false,
+        include_kilocode: false,
         include_kiro: false,
         embeddings,
         backfill_embeddings: false,
@@ -86,7 +88,7 @@ fn torn_jsonl_checkpoint_survives_completion_truncation_and_append() {
     let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
     let lease = ingest_lease(&paths);
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![root];
     let ingest = || ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
     let saved_state = || {
@@ -158,7 +160,7 @@ fn exclusion_filters_new_and_previously_indexed_transcripts() {
     let index = open_search_index(&paths);
 
     // First run with no exclusions indexes both transcripts.
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![claude_root.clone()];
     let lease = ingest_lease(&paths);
     let report = ingest_all(&paths, &index, &options, &lease).expect("first ingest");
@@ -218,7 +220,7 @@ fn memory_edits_refresh_inside_transcript_scan_ttl_without_creating_sessions() {
     .unwrap();
     let paths = Paths::new(Some(tmp.path().join("data"))).unwrap();
     paths.ensure_dirs().unwrap();
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![claude];
     let lease = ingest_lease(&paths);
     ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
@@ -278,7 +280,7 @@ fn ingest_discovers_claude_transcripts_across_multiple_roots() {
     let paths = Paths::new(Some(tmp.path().join("memex-root"))).expect("paths");
     paths.ensure_dirs().expect("ensure dirs");
     let index = open_search_index(&paths);
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![first_root, second_root];
 
     let lease = ingest_lease(&paths);
@@ -489,7 +491,7 @@ fn assert_recovers_vector_crash(publish_interrupted_vectors: bool, embedding_pub
 
     let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
     paths.ensure_dirs().expect("ensure dirs");
-    let mut options = ingest_options(true, ModelChoice::Potion);
+    let mut options = ingest_options(true, ModelChoice::potion());
     options.claude_sources = vec![claude_root];
     {
         let index =
@@ -669,7 +671,7 @@ fn vector_only_pending_ingest_is_completed_when_embeddings_are_disabled() {
     }
     .save_with_lease(&paths.state.join("ingest.json"), &lease)
     .unwrap();
-    let options = ingest_options(false, ModelChoice::Potion);
+    let options = ingest_options(false, ModelChoice::potion());
     ingest_all(&paths, &index, &options, &lease).expect("finish vector recovery");
 
     let vectors = VectorIndex::inventory(&paths.vectors)
@@ -727,7 +729,7 @@ fn vector_recovery_runs_when_pending_session_scopes_are_present() {
     }
     .save_with_lease(&paths.state.join("ingest.json"), &lease)
     .unwrap();
-    let options = ingest_options(false, ModelChoice::Potion);
+    let options = ingest_options(false, ModelChoice::potion());
     ingest_all(&paths, &index, &options, &lease).expect("finish vector recovery");
 
     let vectors = VectorIndex::inventory(&paths.vectors)
@@ -1025,7 +1027,7 @@ fn checkpoint_only_writer_skips_embedding_initialization() {
             vector_dir: paths.vectors.clone(),
             analytics_path: analytics_path(&paths.state),
             progress: Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], true)),
-            model: ModelChoice::Gemma,
+            model: ModelChoice::gemma(),
             embed_runtime: EmbedRuntimeConfig::default(),
             tool_content_limits: IndexedToolContentLimits::default(),
             reconcile_vector_ids: false,
@@ -1051,7 +1053,7 @@ fn replacing_transcript_removes_its_old_vectors() {
     append_claude_message(&transcript, "original");
     let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![source];
     let lease = ingest_lease(&paths);
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
@@ -1088,7 +1090,7 @@ fn enabling_embeddings_backfills_an_unchanged_lexical_index() {
     let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
     let lease = ingest_lease(&paths);
-    let mut options = ingest_options(false, ModelChoice::Potion);
+    let mut options = ingest_options(false, ModelChoice::potion());
     options.claude_sources = vec![source];
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
     ingest_all(&paths, &index, &options, &lease).unwrap();
@@ -1111,7 +1113,7 @@ fn progress_only_append_does_not_skip_missing_embeddings() {
     let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
     let lease = ingest_lease(&paths);
-    let mut options = ingest_options(false, ModelChoice::Potion);
+    let mut options = ingest_options(false, ModelChoice::potion());
     options.claude_sources = vec![source];
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
     ingest_all(&paths, &index, &options, &lease).unwrap();
@@ -1142,7 +1144,7 @@ fn parser_cancellation_preserves_active_vectors() {
 
     let index = open_search_index(&paths);
     let (tx_record, rx_record) = unbounded();
-    for offset in 0..EMBED_BATCH_SIZE {
+    for offset in 0..crate::embed::DEFAULT_EMBED_BATCH_SIZE {
         tx_record
             .send(record(100 + offset as u64, "user", "staged replacement"))
             .expect("send staged embedding record");
@@ -1163,7 +1165,7 @@ fn parser_cancellation_preserves_active_vectors() {
         vector_dir: paths.vectors.clone(),
         analytics_path: analytics_path(&paths.state),
         progress: Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], true)),
-        model: ModelChoice::Potion,
+        model: ModelChoice::potion(),
         embed_runtime: EmbedRuntimeConfig::default(),
         tool_content_limits: IndexedToolContentLimits::default(),
         reconcile_vector_ids: false,
@@ -1355,7 +1357,7 @@ fn no_publish_refresh_retains_deferred_scopes_and_updates_cache_atomically() {
     }
     .save_with_lease(&pending_ingest_path(&paths), &lease)
     .unwrap();
-    let options = ingest_options(false, ModelChoice::Gemma);
+    let options = ingest_options(false, ModelChoice::gemma());
     let index = open_search_index(&paths);
     let report = ingest_all(&paths, &index, &options, &lease).unwrap();
     assert_eq!(report.records_added, 0);
@@ -1489,7 +1491,7 @@ fn opencode_v2_discovery_persists_session_cursors() {
     paths.ensure_dirs().unwrap();
     let lease = ingest_lease(&paths);
     let index = open_search_index(&paths);
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.include_opencode = true;
     let state_path = paths.state.join("ingest.json");
     let mut state = CheckpointSession::open(&state_path, &lease, true, None).unwrap();
@@ -1669,7 +1671,7 @@ fn modern_opencode_database_ingests_once_and_skips_noop_hydration() {
         .add(legacy_record.doc_id, &[1.0, 0.0, 0.0, 0.0])
         .expect("seed legacy vector");
     vectors.save().expect("save legacy vector");
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.include_opencode = true;
 
     IngestState {
@@ -1928,6 +1930,9 @@ fn opencode_v2_dispatch_hydrates_v2_only_session_and_rescan_is_noop() {
             seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
             time_updated INTEGER NOT NULL, data TEXT NOT NULL
          );
+         CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER NOT NULL);
+         INSERT INTO session_v2 VALUES ('s_empty', NULL, '/repo/v2', 1, 1);
+         INSERT INTO event_sequence VALUES ('s_empty', -1);
          INSERT INTO session_v2 VALUES ('s_v2only', NULL, '/repo/v2', 1, 200);
          INSERT INTO session_message VALUES ('sm_user', 's_v2only', 'user', 1, 100, 100, '{\"text\":\"v2 only queryable\"}');
          INSERT INTO session_message VALUES ('sm_assistant', 's_v2only', 'assistant', 2, 200, 200, '{\"content\":[{\"type\":\"text\",\"text\":\"assistant reply\"},{\"type\":\"tool\",\"name\":\"bash\",\"state\":{\"input\":{\"cmd\":\"ls\"},\"metadata\":{\"output\":\"ok\"}}}]}');",
@@ -1938,11 +1943,17 @@ fn opencode_v2_dispatch_hydrates_v2_only_session_and_rescan_is_noop() {
     let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
     paths.ensure_dirs().expect("ensure paths");
     let index = open_search_index(&paths);
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.include_opencode = true;
 
     let first = ingest_all(&paths, &index, &options, &ingest_lease(&paths));
     assert_eq!(first.expect("initial v2 ingest").records_added, 3);
+    assert!(
+        index
+            .records_by_session_id("s_empty")
+            .expect("empty session records")
+            .is_empty()
+    );
     let records = index
         .records_by_session_id("s_v2only")
         .expect("v2-only records");
@@ -1978,6 +1989,19 @@ fn opencode_v2_dispatch_hydrates_v2_only_session_and_rescan_is_noop() {
             .atomic_read(Path::new("meta.json"))
             .unwrap()
     );
+
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute_batch(
+        "UPDATE event_sequence SET seq = 0 WHERE aggregate_id = 's_empty';
+         INSERT INTO session_message VALUES ('sm_first', 's_empty', 'user', 0, 300, 300, '{\"text\":\"first message queryable\"}');",
+    )
+    .unwrap();
+    drop(db);
+    let third = ingest_all(&paths, &index, &options, &ingest_lease(&paths));
+    assert_eq!(third.expect("first message ingest").records_added, 1);
+    let records = index.records_by_session_id("s_empty").unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].text, "first message queryable");
 }
 
 #[test]
@@ -2066,7 +2090,7 @@ fn opencode_shared_history_revert_and_session_deletion_remove_indexed_records() 
         let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
         paths.ensure_dirs().expect("ensure paths");
         let index = open_search_index(&paths);
-        let mut options = ingest_options(false, ModelChoice::Gemma);
+        let mut options = ingest_options(false, ModelChoice::gemma());
         options.include_opencode = true;
         ingest_all(&paths, &index, &options, &ingest_lease(&paths)).expect("initial ingest");
         assert_eq!(index.records_by_session_id("ses_shared").unwrap().len(), 3);
@@ -2566,6 +2590,7 @@ fn device_renumbering_preserves_append_continuity() {
         source_metadata_sha256: None,
         bob_database: None,
         zcode_database: None,
+        kilocode_database: None,
         sqlite_wal: None,
         device: Some(1),
         inode: Some(2),
@@ -2589,6 +2614,7 @@ fn device_renumbering_does_not_hide_file_replacement() {
         source_metadata_sha256: None,
         bob_database: None,
         zcode_database: None,
+        kilocode_database: None,
         sqlite_wal: None,
         device: Some(1),
         inode: Some(2),
@@ -2801,10 +2827,10 @@ fn parser_version_migration_rebuilds_vectors_with_the_existing_model() {
     let mut task = incremental_task(&transcript, SourceKind::Claude, 0, 0, HashMap::new());
     task.change = FileChange::ParserChanged;
 
-    let migration = vector_migration(&paths.vectors, &[task], ModelChoice::Gemma);
+    let migration = vector_migration(&paths.vectors, &[task], &ModelChoice::gemma());
 
     assert!(migration.rebuild);
-    assert_eq!(migration.model, ModelChoice::BGESmall);
+    assert_eq!(migration.model, ModelChoice::bge_small());
 }
 
 #[test]
@@ -2816,10 +2842,10 @@ fn ordinary_file_replacement_does_not_rebuild_the_vector_store() {
     fs::write(&transcript, "{}\n").expect("transcript");
     let task = incremental_task(&transcript, SourceKind::Claude, 0, 0, HashMap::new());
 
-    let migration = vector_migration(&paths.vectors, &[task], ModelChoice::Gemma);
+    let migration = vector_migration(&paths.vectors, &[task], &ModelChoice::gemma());
 
     assert!(!migration.rebuild);
-    assert_eq!(migration.model, ModelChoice::Gemma);
+    assert_eq!(migration.model, ModelChoice::gemma());
 }
 
 #[test]
@@ -2829,7 +2855,7 @@ fn parser_rebuild_keeps_published_vectors_until_replacement_is_saved() {
     save_vector_store(&paths, "bge", 384);
 
     let replacement =
-        open_vector_index_for_ingest(&paths.vectors, 384, ModelChoice::BGESmall, true)
+        open_vector_index_for_ingest(&paths.vectors, 384, &ModelChoice::bge_small(), true)
             .expect("start replacement");
 
     assert!(replacement.is_empty());
@@ -2874,11 +2900,13 @@ fn ingest_claude_records_preserve_sidechain_and_tool_links() {
         include_openclaw: false,
         include_copilot: false,
         include_grok: false,
+        include_hermes: false,
         include_jcode: false,
         include_muse: false,
         include_antigravity: false,
         include_bob: false,
         include_zcode: false,
+        include_kilocode: false,
         embeddings: false,
         backfill_embeddings: false,
         model: ModelChoice::default(),
@@ -3022,7 +3050,7 @@ fn can_skip_noop_index_when_embeddings_are_disabled() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
     let index = open_search_index(&paths);
-    let options = ingest_options(false, ModelChoice::BGESmall);
+    let options = ingest_options(false, ModelChoice::bge_small());
 
     assert!(can_skip_noop_index(&paths, &index, &options).unwrap());
 }
@@ -3032,7 +3060,7 @@ fn can_skip_fresh_scan_when_embeddings_are_disabled() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
     let index = save_search_records(&paths, &[record(1, "user", "hello")]);
-    let options = ingest_options(false, ModelChoice::BGESmall);
+    let options = ingest_options(false, ModelChoice::bge_small());
     let cache = fresh_scan_cache();
     mark_analytics_complete(&paths);
 
@@ -3046,7 +3074,7 @@ fn can_skip_fresh_scan_with_compatible_vectors() {
     let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
     save_vector_store(&paths, "bge", 384);
     let index = save_search_records(&paths, &[record(1, "user", "hello")]);
-    let options = ingest_options(true, ModelChoice::BGESmall);
+    let options = ingest_options(true, ModelChoice::bge_small());
     let cache = fresh_scan_cache();
     mark_analytics_complete(&paths);
 
@@ -3059,7 +3087,7 @@ fn cannot_skip_fresh_scan_when_vectors_are_missing() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
     let index = open_search_index(&paths);
-    let options = ingest_options(true, ModelChoice::BGESmall);
+    let options = ingest_options(true, ModelChoice::bge_small());
     let cache = fresh_scan_cache();
 
     cache.save(&paths.state.join("scan_cache.json")).unwrap();
@@ -3071,7 +3099,7 @@ fn cannot_skip_fresh_scan_with_pending_ingest() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
     let index = save_search_records(&paths, &[record(1, "user", "hello")]);
-    let options = ingest_options(false, ModelChoice::BGESmall);
+    let options = ingest_options(false, ModelChoice::bge_small());
     let cache = fresh_scan_cache();
     mark_analytics_complete(&paths);
     PendingIngest {
@@ -3099,7 +3127,7 @@ fn freshness_uses_sqlite_pending_and_cache_without_sidecars() {
     let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
     let lease = ingest_lease(&paths);
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![source];
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
     ingest_all(&paths, &index, &options, &lease).unwrap();
@@ -3186,7 +3214,7 @@ fn freshness_reads_legacy_and_sql_v1_sidecars_without_upgrade() {
         let marker = fs::read(&state_path).unwrap();
         let index = save_search_records(&paths, &[record(1, "user", "original")]);
         mark_analytics_complete(&paths);
-        let options = ingest_options(false, ModelChoice::Gemma);
+        let options = ingest_options(false, ModelChoice::gemma());
         fresh_scan_cache()
             .save(&paths.state.join("scan_cache.json"))
             .unwrap();
@@ -3219,7 +3247,7 @@ fn database_discovery_error_never_allows_fresh_scan_skip() {
     let _env = EnvVarGuard::set_os(&[("OPENCODE_DATA_DIR", Some(bad_root.as_os_str()))]);
     let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
     let index = save_search_records(&paths, &[record(1, "user", "hello")]);
-    let options = ingest_options(false, ModelChoice::BGESmall);
+    let options = ingest_options(false, ModelChoice::bge_small());
     let mut options = options;
     options.include_opencode = true;
     mark_analytics_complete(&paths);
@@ -3238,7 +3266,7 @@ fn cannot_skip_fresh_scan_with_incompatible_vectors() {
     let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
     save_vector_store(&paths, "minilm", 384);
     let index = open_search_index(&paths);
-    let options = ingest_options(true, ModelChoice::BGESmall);
+    let options = ingest_options(true, ModelChoice::bge_small());
     let cache = fresh_scan_cache();
 
     cache.save(&paths.state.join("scan_cache.json")).unwrap();
@@ -3250,7 +3278,7 @@ fn cannot_skip_fresh_scan_when_cache_is_stale() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
     let index = open_search_index(&paths);
-    let options = ingest_options(false, ModelChoice::BGESmall);
+    let options = ingest_options(false, ModelChoice::bge_small());
     let cache = ScanCache {
         last_scan_ts: 0,
         file_count: 0,
@@ -3288,7 +3316,7 @@ fn can_skip_noop_index_with_compatible_vectors() {
     let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
     save_vector_store(&paths, "bge", 384);
     let index = save_search_records(&paths, &[record(1, "user", "hello")]);
-    let options = ingest_options(true, ModelChoice::BGESmall);
+    let options = ingest_options(true, ModelChoice::bge_small());
 
     assert!(can_skip_noop_index(&paths, &index, &options).unwrap());
 }
@@ -3305,7 +3333,7 @@ fn cannot_skip_noop_index_with_partial_compatible_vectors() {
             record(2, "assistant", "missing vector"),
         ],
     );
-    let options = ingest_options(true, ModelChoice::BGESmall);
+    let options = ingest_options(true, ModelChoice::bge_small());
 
     assert!(!can_skip_noop_index(&paths, &index, &options).unwrap());
 }
@@ -3323,7 +3351,7 @@ fn can_skip_noop_index_ignores_records_that_do_not_need_embeddings() {
             record(3, "assistant", ""),
         ],
     );
-    let options = ingest_options(true, ModelChoice::BGESmall);
+    let options = ingest_options(true, ModelChoice::bge_small());
 
     assert!(can_skip_noop_index(&paths, &index, &options).unwrap());
 }
@@ -3333,7 +3361,7 @@ fn cannot_skip_noop_index_when_vectors_are_missing() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
     let index = open_search_index(&paths);
-    let options = ingest_options(true, ModelChoice::BGESmall);
+    let options = ingest_options(true, ModelChoice::bge_small());
 
     assert!(!can_skip_noop_index(&paths, &index, &options).unwrap());
 }
@@ -3344,7 +3372,7 @@ fn cannot_skip_noop_index_with_incompatible_vectors() {
     let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
     save_vector_store(&paths, "minilm", 384);
     let index = open_search_index(&paths);
-    let options = ingest_options(true, ModelChoice::BGESmall);
+    let options = ingest_options(true, ModelChoice::bge_small());
 
     assert!(!can_skip_noop_index(&paths, &index, &options).unwrap());
 }
@@ -3355,20 +3383,162 @@ fn cannot_skip_noop_index_with_wrong_vector_dimensions() {
     let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
     save_vector_store(&paths, "bge", 768);
     let index = open_search_index(&paths);
-    let options = ingest_options(true, ModelChoice::BGESmall);
+    let options = ingest_options(true, ModelChoice::bge_small());
 
     assert!(!can_skip_noop_index(&paths, &index, &options).unwrap());
 }
 
 #[test]
-fn cannot_skip_noop_index_when_model_dimensions_are_dynamic() {
+fn can_skip_noop_index_when_unknown_dimensions_match_stored_identity() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
     save_vector_store(&paths, "potion", 256);
     let index = open_search_index(&paths);
-    let options = ingest_options(true, ModelChoice::Potion);
 
+    assert!(
+        can_skip_noop_index(&paths, &index, &ingest_options(true, ModelChoice::potion())).unwrap()
+    );
+    assert!(
+        !can_skip_noop_index(&paths, &index, &ingest_options(true, ModelChoice::minilm())).unwrap()
+    );
+}
+
+fn unroutable_remote_runtime(dimensions: Option<usize>) -> EmbedRuntimeConfig {
+    EmbedRuntimeConfig {
+        remote: Some(crate::embed::RemoteEmbedConfig {
+            endpoint: crate::remote_embed::RemoteEndpoint {
+                base_url: "http://127.0.0.1:9/v1".to_string(),
+                api_key: None,
+                timeout: Duration::from_millis(100),
+                max_retries: 0,
+            },
+            dimensions,
+        }),
+        ..EmbedRuntimeConfig::default()
+    }
+}
+
+#[test]
+fn remote_noop_index_trusts_stored_identity_without_contacting_server() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+    save_vector_store(&paths, "remote:text-embedding-3-small", 1536);
+    let index = save_search_records(&paths, &[record(1, "user", "hello")]);
+    let mut options = ingest_options(
+        true,
+        ModelChoice::Remote("text-embedding-3-small".to_string()),
+    );
+    options.embed_runtime = unroutable_remote_runtime(None);
+    assert!(can_skip_noop_index(&paths, &index, &options).unwrap());
+
+    options.embed_runtime = unroutable_remote_runtime(Some(1536));
+    assert!(can_skip_noop_index(&paths, &index, &options).unwrap());
+
+    options.embed_runtime = unroutable_remote_runtime(Some(512));
     assert!(!can_skip_noop_index(&paths, &index, &options).unwrap());
+
+    options.embed_runtime = unroutable_remote_runtime(None);
+    options.model = ModelChoice::Remote("text-embedding-3-large".to_string());
+    assert!(!can_skip_noop_index(&paths, &index, &options).unwrap());
+}
+
+#[test]
+fn records_with_a_blank_embedded_prefix_are_not_counted_as_missing_vectors() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+    save_vector_store(&paths, "bge", 384);
+    let blank_prefix = format!("{}tail", " ".repeat(EMBED_MAX_CHARS));
+    let blank = record(2, "user", &blank_prefix);
+    assert!(!record_needs_embedding(&blank));
+    let index = save_search_records(&paths, &[record(1, "user", "hello"), blank]);
+
+    let options = ingest_options(true, ModelChoice::bge_small());
+    assert!(can_skip_noop_index(&paths, &index, &options).unwrap());
+}
+
+#[test]
+fn parser_migration_without_remote_endpoint_keeps_remote_vectors() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let claude_root = tmp.path().join("claude-projects");
+    let project = claude_root.join("project");
+    fs::create_dir_all(&project).expect("create project dir");
+    let transcript = project.join("session.jsonl");
+    fs::write(
+        &transcript,
+        br#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hello"}]},"uuid":"u1","timestamp":"2024-01-01T00:00:00Z"}
+"#,
+    )
+    .expect("write transcript");
+    let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+    paths.ensure_dirs().expect("ensure dirs");
+    let index = open_search_index(&paths);
+    let lease = ingest_lease(&paths);
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.claude_sources = vec![claude_root];
+    assert_eq!(
+        ingest_all(&paths, &index, &options, &lease)
+            .expect("first ingest")
+            .records_added,
+        1
+    );
+
+    let state_path = paths.state.join("ingest.json");
+    let mut state = IngestState::load(&state_path).expect("load state");
+    state
+        .files
+        .get_mut(&transcript.to_string_lossy().into_owned())
+        .expect("transcript state")
+        .parser_version = crate::sources::index_state_version(SourceKind::Claude) - 1;
+    state
+        .save_with_lease(&state_path, &lease)
+        .expect("save state");
+    let live_doc_ids = || {
+        let mut ids = Vec::new();
+        open_search_index(&paths)
+            .for_each_record(|record| {
+                ids.push(record.doc_id);
+                Ok(())
+            })
+            .expect("collect doc ids");
+        ids
+    };
+    let parsed_ids = live_doc_ids();
+    assert_eq!(parsed_ids.len(), 1);
+    // Vectors for the transcript's records plus one unrelated record that must survive.
+    let unrelated = 1_000_000;
+    let mut vectors =
+        VectorIndex::open_or_create(&paths.vectors, 8, Some("remote:text-embedding-3-small"))
+            .expect("open vector store");
+    for &doc_id in parsed_ids.iter().chain([&unrelated]) {
+        vectors.add(doc_id, &[0.5; 8]).expect("add vector");
+    }
+    vectors.save().expect("save vectors");
+    drop(vectors);
+
+    let report = ingest_all(&paths, &index, &options, &lease).expect("reparse without endpoint");
+    assert_eq!(report.records_added, 1);
+    assert_eq!(report.records_embedded, 0);
+    let reparsed_ids = live_doc_ids();
+    assert_eq!(reparsed_ids.len(), 1);
+    assert!(reparsed_ids.iter().all(|id| !parsed_ids.contains(id)));
+    let vectors = VectorIndex::open(&paths.vectors).expect("open vectors");
+    assert_eq!(vectors.model(), Some("remote:text-embedding-3-small"));
+    assert_eq!(vectors.dimensions(), 8);
+    // Neither the old nor the new doc IDs of the re-parsed transcript have a vector.
+    let hits = vectors.search(&[0.5; 8], 10).expect("search vectors");
+    assert_eq!(
+        hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        [unrelated]
+    );
+    drop(vectors);
+
+    // The parser state is current again, so the next run neither re-parses nor warns.
+    let report = ingest_all(&paths, &index, &options, &lease).expect("steady ingest");
+    assert_eq!(report.records_added, 0);
+    assert_eq!(
+        PendingIngest::load(&pending_ingest_path(&paths)).expect("pending marker"),
+        None
+    );
 }
 #[test]
 fn collect_pi_files_recurses_under_sessions_root() {
@@ -3508,11 +3678,13 @@ fn ingest_pi_session_records_supported_message_shapes() {
         include_openclaw: false,
         include_copilot: false,
         include_grok: false,
+        include_hermes: false,
         include_jcode: false,
         include_muse: false,
         include_antigravity: false,
         include_bob: false,
         include_zcode: false,
+        include_kilocode: false,
         embeddings: false,
         backfill_embeddings: false,
         model: ModelChoice::default(),
@@ -3735,6 +3907,371 @@ fn ingest_grok_session_from_grok_home_override() {
             .iter()
             .all(|record| record.source_path == session_file.to_string_lossy())
     );
+}
+
+#[test]
+fn ingest_hermes_in_place_edits_replace_text_and_session_metadata() {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hermes");
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.db");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(include_str!("../../fixtures/trajectory_parity/hermes.sql"))
+        .unwrap();
+    let _env = EnvVarGuard::set_os(&[("HERMES_PROFILE_ROOTS", Some(root.as_os_str()))]);
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let index = open_search_index(&paths);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_hermes = true;
+    let lease = ingest_lease(&paths);
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+
+    connection
+        .execute(
+            "update messages set content = 'expanded user prompt' where id = 101",
+            [],
+        )
+        .unwrap();
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    let records = index.records_by_session_id("hermes-session").unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|record| record.text == "expanded user prompt")
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.text == "Check the current directory.")
+    );
+
+    connection
+        .execute_batch(
+            "update messages set content = 'revised user prompt' where id = 101;
+         insert into messages(session_id, role, content, timestamp)
+         values ('hermes-session', 'user', 'new tail message', 12);",
+        )
+        .unwrap();
+    let report = ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert!(
+        report.records_added > 1,
+        "an edited prefix must be replaced, not appended"
+    );
+    let records = index.records_by_session_id("hermes-session").unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|record| record.text == "revised user prompt")
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.text == "expanded user prompt")
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.text == "new tail message")
+            .count(),
+        1
+    );
+
+    connection
+        .execute(
+            "update sessions set cwd = '/workspace/renamed-project', parent_session_id = 'parent'",
+            [],
+        )
+        .unwrap();
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    let records = index.records_by_session_id("hermes-session").unwrap();
+    assert!(
+        records
+            .iter()
+            .all(|record| record.project == "renamed-project")
+    );
+    assert!(
+        records
+            .iter()
+            .all(|record| record.links.parent_session_id.as_deref() == Some("parent"))
+    );
+}
+
+#[test]
+fn ingest_hermes_sidecar_edits_replace_existing_reply_text() {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hermes");
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.db");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(include_str!("../../fixtures/trajectory_parity/hermes.sql"))
+        .unwrap();
+    connection
+        .execute_batch(
+            "alter table messages add column codex_message_items text;
+         update messages set content = '' where id = 104;",
+        )
+        .unwrap();
+    let reply = |text: &str| {
+        serde_json::json!([
+            {"type": "message", "role": "assistant", "phase": "final_answer",
+             "content": [{"type": "output_text", "text": text}]}
+        ])
+        .to_string()
+    };
+    connection
+        .execute(
+            "update messages set codex_message_items = ?1 where id = 104",
+            [reply("original sidecar reply")],
+        )
+        .unwrap();
+    let _env = EnvVarGuard::set_os(&[("HERMES_PROFILE_ROOTS", Some(root.as_os_str()))]);
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let index = open_search_index(&paths);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_hermes = true;
+    let lease = ingest_lease(&paths);
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert!(
+        index
+            .records_by_session_id("hermes-session")
+            .unwrap()
+            .iter()
+            .any(|record| record.text == "original sidecar reply")
+    );
+
+    connection
+        .execute(
+            "update messages set codex_message_items = ?1 where id = 104",
+            [reply("revised sidecar reply")],
+        )
+        .unwrap();
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    let records = index.records_by_session_id("hermes-session").unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|record| record.text == "revised sidecar reply")
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.text == "original sidecar reply")
+    );
+}
+
+#[test]
+fn ingest_hermes_deactivation_replaces_previously_indexed_records() {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let hermes_root = tmp.path().join("hermes");
+    fs::create_dir_all(&hermes_root).expect("create Hermes root");
+    let database = hermes_root.join("state.db");
+    let connection = rusqlite::Connection::open(&database).expect("open Hermes fixture");
+    connection
+        .execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version VALUES (1);
+             CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY, cwd TEXT, parent_session_id TEXT,
+                 rewind_count INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+                 role TEXT NOT NULL, content TEXT, tool_call_id TEXT,
+                 tool_calls TEXT, tool_name TEXT, timestamp REAL NOT NULL,
+                 reasoning TEXT, reasoning_content TEXT,
+                 active INTEGER NOT NULL DEFAULT 1
+             );
+             INSERT INTO sessions(id, cwd) VALUES ('session', '/workspace/hermes');
+             INSERT INTO messages(session_id, role, content, timestamp)
+             VALUES ('session', 'user', 'obsolete hermes text', 1);",
+        )
+        .expect("seed Hermes fixture");
+
+    let _env = EnvVarGuard::set_os(&[("HERMES_PROFILE_ROOTS", Some(hermes_root.as_os_str()))]);
+    let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+    paths.ensure_dirs().expect("ensure paths");
+    let index = open_search_index(&paths);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_hermes = true;
+    let lease = ingest_lease(&paths);
+
+    assert_eq!(
+        ingest_all(&paths, &index, &options, &lease)
+            .expect("initial ingest")
+            .records_added,
+        1
+    );
+    connection
+        .execute_batch(
+            "UPDATE messages SET active = 0 WHERE id = 1;
+             INSERT INTO messages(session_id, role, content, timestamp)
+             VALUES ('session', 'user', 'replacement hermes text', 2);",
+        )
+        .expect("deactivate and replace message");
+    assert_eq!(
+        ingest_all(&paths, &index, &options, &lease)
+            .expect("replacement ingest")
+            .records_added,
+        1
+    );
+
+    let records = index
+        .records_by_session_id("session")
+        .expect("Hermes records");
+    assert_eq!(
+        records.len(),
+        1,
+        "inactive record must be removed: {records:?}"
+    );
+    assert_eq!(records[0].text, "replacement hermes text");
+}
+
+fn assert_hermes_reasoning_switch(initial: bool, desired: bool) {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hermes");
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.db");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(include_str!("../../fixtures/trajectory_parity/hermes.sql"))
+        .unwrap();
+    drop(connection);
+    let _env = EnvVarGuard::set_os(&[("HERMES_PROFILE_ROOTS", Some(root.as_os_str()))]);
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let index = open_search_index(&paths);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_hermes = true;
+    options.include_reasoning = initial;
+    let lease = ingest_lease(&paths);
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    options.include_reasoning = desired;
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    let records = index.records_by_session_id("hermes-session").unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.role == "reasoning")
+            .count(),
+        usize::from(desired),
+        "the existing session must reflect the current reasoning option"
+    );
+}
+
+#[test]
+fn ingest_hermes_enabling_reasoning_reindexes_existing_messages() {
+    assert_hermes_reasoning_switch(false, true);
+}
+
+#[test]
+fn ingest_hermes_disabling_reasoning_removes_existing_reasoning() {
+    assert_hermes_reasoning_switch(true, false);
+}
+
+#[test]
+fn ingest_hermes_replaced_database_reindexes_same_message_ids() {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hermes");
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.db");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(include_str!("../../fixtures/trajectory_parity/hermes.sql"))
+        .unwrap();
+    drop(connection);
+    let _env = EnvVarGuard::set_os(&[("HERMES_PROFILE_ROOTS", Some(root.as_os_str()))]);
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let index = open_search_index(&paths);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_hermes = true;
+    let lease = ingest_lease(&paths);
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+
+    let replacement = root.join("restored.db");
+    let connection = rusqlite::Connection::open(&replacement).unwrap();
+    connection
+        .execute_batch(include_str!("../../fixtures/trajectory_parity/hermes.sql"))
+        .unwrap();
+    connection
+        .execute(
+            "update messages set content = 'restored transcript' where id = 101",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    fs::rename(&replacement, &database).unwrap();
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    let records = index.records_by_session_id("hermes-session").unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|record| record.text == "restored transcript")
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.text == "Check the current directory.")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ingest_hermes_wal_appends_remain_incremental_after_checkpoint() {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hermes");
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.db");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(include_str!("../../fixtures/trajectory_parity/hermes.sql"))
+        .unwrap();
+    connection
+        .execute_batch("pragma wal_autocheckpoint = 0")
+        .unwrap();
+    let _env = EnvVarGuard::set_os(&[("HERMES_PROFILE_ROOTS", Some(root.as_os_str()))]);
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let index = open_search_index(&paths);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_hermes = true;
+    let lease = ingest_lease(&paths);
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+
+    for timestamp in [11, 12] {
+        connection
+            .execute(
+                "insert into messages(session_id, role, content, timestamp)
+                 values ('hermes-session', 'user', 'new message', ?1)",
+                rusqlite::params![timestamp],
+            )
+            .unwrap();
+        assert_eq!(
+            ingest_all(&paths, &index, &options, &lease)
+                .unwrap()
+                .records_added,
+            1
+        );
+        connection
+            .execute_batch("pragma wal_checkpoint(truncate)")
+            .unwrap();
+        assert_eq!(
+            ingest_all(&paths, &index, &options, &lease)
+                .unwrap()
+                .records_added,
+            0
+        );
+    }
 }
 
 #[test]
@@ -4027,7 +4564,7 @@ fn targeted_ingest_only_updates_selected_files_until_reconciliation() {
     append_claude_message(&second, "second original");
     let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![source];
     let lease = ingest_lease(&paths);
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
@@ -4111,7 +4648,7 @@ fn targeted_ingest_creates_and_replaces_files_without_unrelated_discovery() {
     append_claude_message(&first, "existing");
     let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![source.clone()];
     let lease = ingest_lease(&paths);
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
@@ -4157,7 +4694,7 @@ fn targeted_ingest_escalates_pending_publication_to_full_recovery() {
     append_claude_message(&second, "second original");
     let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![source];
     let lease = ingest_lease(&paths);
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
@@ -4248,7 +4785,7 @@ fn targeted_ingest_preserves_unselected_database_ownership_and_wal_updates() {
     let first_writer = create(&first, "first");
     let second_writer = create(&second, "second");
     let _env = EnvVarGuard::set_os(&[("OPENCODE_DATA_DIR", Some(source.as_os_str()))]);
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.include_opencode = true;
     let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
@@ -4328,7 +4865,7 @@ fn targeted_ingest_codex_history_uses_known_rollouts_without_discovery() {
     )
     .unwrap();
     let _env = EnvVarGuard::set_os(&[("CODEX_HOME", Some(home.as_os_str()))]);
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.include_codex = true;
     let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
@@ -4364,7 +4901,7 @@ fn full_reconciliation_removes_confirmed_missing_transcript_everywhere() {
     append_claude_message(&surviving, "keep this transcript");
     let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![source];
     let lease = ingest_lease(&paths);
     let index = SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
@@ -4468,7 +5005,7 @@ fn full_reconciliation_keeps_history_when_a_transcript_parent_is_unavailable() {
     append_claude_message(&transcript, "must survive unavailable parent");
     let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![root];
     let lease = ingest_lease(&paths);
     ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
@@ -4498,7 +5035,7 @@ fn background_marker_completed_after_partial_ingest_reclassifies_session() {
     append_claude_message(&transcript, &"initial text ".repeat(500));
     let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![source];
     let lease = ingest_lease(&paths);
     ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
@@ -4554,7 +5091,7 @@ fn incremental_claude_background_marker_reclassifies_prior_records() {
     append_claude_message(&transcript, "before background marker");
     let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![source];
     let lease = ingest_lease(&paths);
     ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
@@ -4617,7 +5154,7 @@ fn claude_parser_defers_background_marker_appended_after_task_boundary() {
     append_claude_message(&transcript, "initial record");
     let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![source];
     let lease = ingest_lease(&paths);
     ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
@@ -4746,7 +5283,7 @@ fn antigravity_ingest_tracks_wal_updates_and_checkpoint_without_duplicates() {
             .unwrap();
     };
     put("original");
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.include_antigravity = true;
     let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
@@ -4801,7 +5338,7 @@ fn antigravity_cli_transcript_ingests_through_full_scan_and_dirty_selection() {
         r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-09-15T23:44:54Z","content":"<USER_REQUEST>\nfind the leak\n</USER_REQUEST>"}"#,
         r#"{"step_index":1,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-09-15T23:44:56Z","content":"patched it"}"#,
     ]);
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.include_antigravity = true;
     let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
@@ -4861,7 +5398,7 @@ fn antigravity_projection_changes_retire_all_published_state() {
         let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
         paths.ensure_dirs().unwrap();
         let lease = ingest_lease(&paths);
-        let mut options = ingest_options(false, ModelChoice::Gemma);
+        let mut options = ingest_options(false, ModelChoice::gemma());
         options.include_antigravity = true;
         let refresh = |hint: &Path| {
             let index = open_search_index(&paths);
@@ -5332,7 +5869,7 @@ fn cleanup_only_vector_recovery_reconciles_orphans_without_deletion_targets() {
 
     // A cleanup-only recovery must be able to use the existing vector
     // store even when the configured embedding model is unavailable.
-    let options = ingest_options(false, ModelChoice::Gemma);
+    let options = ingest_options(false, ModelChoice::gemma());
     ingest_all(
         &paths,
         &open_search_index(&paths),
@@ -5575,7 +6112,7 @@ fn full_single_source_reads_and_writes_only_discovered_checkpoint() {
     paths.ensure_dirs().unwrap();
     let lease = ingest_lease(&paths);
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![source];
     ingest_all(&paths, &index, &options, &lease).unwrap();
     let state_path = paths.state.join("ingest.json");
@@ -5681,7 +6218,7 @@ fn checkpoint_failure_after_publication_keeps_pending_recoverable() {
     paths.ensure_dirs().unwrap();
     let lease = ingest_lease(&paths);
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![source];
     ingest_all(&paths, &index, &options, &lease).unwrap();
     let state_path = paths.state.join("ingest.json");
@@ -5742,7 +6279,7 @@ fn early_intent_failure_cancels_publication_without_flushing_recovery_changes() 
     let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
     let lease = ingest_lease(&paths);
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![source];
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
     ingest_all(&paths, &index, &options, &lease).unwrap();
@@ -5898,7 +6435,7 @@ fn journal_refreshes_narrow_to_changed_paths_and_walk_after_a_directory_rename()
     let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
     let lease = ingest_lease(&paths);
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![root.clone()];
     let settle = || std::thread::sleep(Duration::from_millis(150));
     let refresh = || {
@@ -5965,7 +6502,7 @@ fn full_scan_preserves_the_cursor_captured_before_fallback() {
     paths.ensure_dirs().unwrap();
     let lease = ingest_lease(&paths);
     let index = open_search_index(&paths);
-    let options = ingest_options(false, ModelChoice::Gemma);
+    let options = ingest_options(false, ModelChoice::gemma());
     let mut recovered = recover_checkpoint(&paths, &index, &lease, None).unwrap();
     let cursor = journal::JournalCursorUpdate {
         fingerprint: "captured-before-fallback".into(),
@@ -6051,7 +6588,7 @@ fn zcode_refresh_preserves_other_session_ids_and_embeddings() {
     writer
         .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
         .unwrap();
-    let mut options = ingest_options(true, ModelChoice::Potion);
+    let mut options = ingest_options(true, ModelChoice::potion());
     options.include_zcode = true;
     let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
@@ -6070,7 +6607,7 @@ fn zcode_refresh_preserves_other_session_ids_and_embeddings() {
     };
     let child_id = child_records()[0].doc_id;
     let mut embedder = crate::embed::EmbedderHandle::with_model_and_runtime(
-        ModelChoice::Potion,
+        &ModelChoice::potion(),
         &options.embed_runtime,
     )
     .unwrap();
@@ -6157,6 +6694,133 @@ fn zcode_refresh_preserves_other_session_ids_and_embeddings() {
 }
 
 #[test]
+fn zcode_store_that_never_existed_is_not_reported_unreadable() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("zcode");
+    let _env = EnvVarGuard::set_os(&[("ZCODE_HOME", Some(root.as_os_str()))]);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_zcode = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let report = ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert!(report.diagnostics.unreadable_sources.is_empty());
+}
+
+#[test]
+fn zcode_store_removed_with_its_directory_keeps_indexed_sessions() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("zcode");
+    let database = root.join("cli/db/db.sqlite");
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let _env = EnvVarGuard::set_os(&[("ZCODE_HOME", Some(root.as_os_str()))]);
+    crate::sources::zcode::tests::fixture_db(&database);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_zcode = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let full = || {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap()
+    };
+    full();
+    let indexed = indexed_texts(&paths);
+    assert!(!indexed.is_empty());
+
+    fs::remove_dir_all(&root).unwrap();
+    let report = full();
+    assert_eq!(indexed_texts(&paths), indexed);
+    assert_eq!(
+        report.diagnostics.unreadable_sources,
+        vec![database.to_string_lossy().into_owned()]
+    );
+}
+
+#[test]
+fn zcode_pending_recovery_preserves_sessions_when_store_directory_is_missing() {
+    let _guard = env_lock();
+    for has_previous_checkpoint in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("zcode");
+        let database = root.join("cli/db/db.sqlite");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let _env = EnvVarGuard::set_os(&[("ZCODE_HOME", Some(root.as_os_str()))]);
+        crate::sources::zcode::tests::fixture_db(&database);
+        let mut options = ingest_options(false, ModelChoice::default());
+        options.include_zcode = true;
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let lease = ingest_lease(&paths);
+        let state_path = paths.state.join("ingest.json");
+        IngestState::default()
+            .save_with_lease(&state_path, &lease)
+            .unwrap();
+        let refresh = || {
+            let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+            ingest_all(&paths, &index, &options, &lease)
+        };
+        if has_previous_checkpoint {
+            refresh().unwrap();
+            // Change every session so recovery hides all of the store's checkpoints.
+            rusqlite::Connection::open(&database)
+                .unwrap()
+                .execute("UPDATE session SET directory = '/work/replay'", [])
+                .unwrap();
+        }
+        let checkpoint =
+            rusqlite::Connection::open(paths.state.join("checkpoints.sqlite")).unwrap();
+        checkpoint
+            .execute_batch("CREATE TRIGGER fail_checkpoint BEFORE UPDATE OF scancache_json ON metadata BEGIN SELECT RAISE(FAIL, 'checkpoint failure'); END;")
+            .unwrap();
+        let error = refresh().unwrap_err();
+        assert!(format!("{error:#}").contains("checkpoint failure"));
+        checkpoint
+            .execute_batch("DROP TRIGGER fail_checkpoint")
+            .unwrap();
+        let saved = IngestState::load(&state_path).unwrap();
+        assert_eq!(
+            saved.files.len(),
+            if has_previous_checkpoint { 2 } else { 0 }
+        );
+        let indexed = indexed_texts(&paths);
+        assert_eq!(indexed.len(), 5);
+        let pending = PendingIngest::load(&pending_ingest_path(&paths))
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.source_paths.len(), 2);
+
+        let unavailable = temp.path().join("unavailable");
+        fs::rename(&root, &unavailable).unwrap();
+        let error = refresh().unwrap_err();
+        assert!(
+            error.to_string().contains("interrupted replay"),
+            "{error:#}"
+        );
+        assert_eq!(indexed_texts(&paths), indexed);
+        assert_eq!(IngestState::load(&state_path).unwrap().files, saved.files);
+        assert_eq!(
+            PendingIngest::load(&pending_ingest_path(&paths)).unwrap(),
+            Some(pending)
+        );
+
+        fs::rename(&unavailable, &root).unwrap();
+        assert_eq!(refresh().unwrap().records_added, 5);
+        assert_eq!(indexed_texts(&paths), indexed);
+        assert_eq!(IngestState::load(&state_path).unwrap().files.len(), 2);
+        assert!(
+            PendingIngest::load(&pending_ingest_path(&paths))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(refresh().unwrap().records_added, 0);
+    }
+}
+
+#[test]
 fn zcode_migrates_database_checkpoint_and_honors_session_exclusions() {
     let _guard = env_lock();
     let temp = tempfile::tempdir().unwrap();
@@ -6194,7 +6858,7 @@ fn zcode_migrates_database_checkpoint_and_honors_session_exclusions() {
     }
     .save_with_lease(&paths.state.join("ingest.json"), &lease)
     .unwrap();
-    let mut options = ingest_options(false, ModelChoice::Potion);
+    let mut options = ingest_options(false, ModelChoice::potion());
     options.include_zcode = true;
     let run = |options: &IngestOptions| {
         let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
@@ -6218,6 +6882,226 @@ fn zcode_migrates_database_checkpoint_and_honors_session_exclusions() {
     ];
     run(&options);
     assert_eq!(indexed_texts(&paths), ["subagent prompt"]);
+    options.exclude_patterns = vec![database.to_string_lossy().into_owned()];
+    run(&options);
+    assert!(indexed_texts(&paths).is_empty());
+}
+
+#[test]
+fn kilocode_refresh_preserves_other_session_ids_and_embeddings() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("kilo");
+    let database = root.join("kilo.db");
+    fs::create_dir_all(&root).unwrap();
+    let _env = EnvVarGuard::set_os(&[("KILO_DATA_DIR", Some(root.as_os_str()))]);
+    crate::sources::kilocode::tests::fixture_db(&database);
+    let writer = rusqlite::Connection::open(&database).unwrap();
+    writer
+        .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+        .unwrap();
+    let mut options = ingest_options(true, ModelChoice::potion());
+    options.include_kilocode = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let full = || {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap()
+    };
+    let first = full();
+    assert!(first.records_embedded > 0);
+    let child_records = || {
+        SearchIndex::open_or_create(&paths.index)
+            .unwrap()
+            .records_by_session_id("ses_child")
+            .unwrap()
+    };
+    let child_id = child_records()[0].doc_id;
+    let mut embedder = crate::embed::EmbedderHandle::with_model_and_runtime(
+        &ModelChoice::potion(),
+        &options.embed_runtime,
+    )
+    .unwrap();
+    let query = embedder.embed_texts(&["child answer"]).unwrap().remove(0);
+    let child_distance = || {
+        VectorIndex::open(&paths.vectors)
+            .unwrap()
+            .search(&query, 20)
+            .unwrap()
+            .into_iter()
+            .find(|(id, _)| *id == child_id)
+            .unwrap()
+            .1
+    };
+    let original_distance = child_distance();
+    assert_eq!(full().records_added, 0);
+
+    // Rewriting a part in place leaves the database size untouched; the
+    // per-session content hash still schedules exactly that session.
+    let before = database.metadata().unwrap();
+    writer
+        .execute(
+            "UPDATE part SET data = ?1 WHERE id = 'prt_t'",
+            [r#"{"type":"text","text":"changed main prompt"}"#],
+        )
+        .unwrap();
+    assert_eq!(before.len(), database.metadata().unwrap().len());
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let dirty = ingest_dirty(
+        &paths,
+        &index,
+        &options,
+        &lease,
+        &HashSet::from([database.with_file_name("kilo.db-wal")]),
+    )
+    .unwrap();
+    assert!(!dirty.full_scan);
+    assert_eq!(child_records()[0].doc_id, child_id);
+    assert_eq!(child_distance(), original_distance);
+    drop(index);
+
+    let main_ids = || {
+        let mut ids = SearchIndex::open_or_create(&paths.index)
+            .unwrap()
+            .records_by_session_id("ses_main")
+            .unwrap()
+            .into_iter()
+            .map(|record| record.doc_id)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    };
+    let original_main_ids = main_ids();
+
+    // A real usage-only commit must preserve the affected session too.
+    writer
+        .execute_batch(
+            "UPDATE message SET data = json_set(data, '$.tokens.input', 999, '$.cost', 4.2),
+                time_updated = 10000 WHERE id = 'msg_a';
+             UPDATE session SET time_updated = 10000 WHERE id = 'ses_main';
+             UPDATE part SET data = json_set(data, '$.tokens.input', 999),
+                time_updated = 10000 WHERE id = 'prt_f';",
+        )
+        .unwrap();
+    let usage_only = full();
+    assert_eq!(usage_only.records_added, 0);
+    assert_eq!(usage_only.records_embedded, 0);
+    assert_eq!(main_ids(), original_main_ids);
+    assert_eq!(child_records()[0].doc_id, child_id);
+    assert_eq!(child_distance(), original_distance);
+
+    // New skipped parts must not change the logical checkpoint size, either.
+    writer
+        .execute_batch(
+            "INSERT INTO part VALUES ('prt_accounting', 'msg_a', 'ses_main', 10000, 10000,
+                '{\"type\":\"step-finish\",\"tokens\":{\"input\":999}}');",
+        )
+        .unwrap();
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let skipped_part = ingest_dirty(
+        &paths,
+        &index,
+        &options,
+        &lease,
+        &HashSet::from([database.with_file_name("kilo.db-wal")]),
+    )
+    .unwrap();
+    assert!(!skipped_part.full_scan);
+    assert_eq!(skipped_part.report.records_added, 0);
+    assert_eq!(skipped_part.report.records_embedded, 0);
+    assert_eq!(main_ids(), original_main_ids);
+    drop(index);
+
+    writer
+        .execute("DELETE FROM part WHERE id = 'prt_t'", [])
+        .unwrap();
+    full();
+    assert!(!indexed_texts(&paths).contains(&"changed main prompt".to_string()));
+    writer
+        .execute("DELETE FROM session WHERE id = 'ses_child'", [])
+        .unwrap();
+    full();
+    assert!(child_records().is_empty());
+
+    // An unreadable store must not purge its existing sessions.
+    let before = indexed_texts(&paths);
+    writer
+        .execute_batch("ALTER TABLE session RENAME TO unavailable_session")
+        .unwrap();
+    full();
+    assert_eq!(indexed_texts(&paths), before);
+    writer
+        .execute_batch("ALTER TABLE unavailable_session RENAME TO session")
+        .unwrap();
+    drop(writer);
+    fs::remove_file(&database).unwrap();
+    full();
+    assert!(indexed_texts(&paths).is_empty());
+}
+
+#[test]
+fn kilocode_migrates_database_checkpoint_and_honors_session_exclusions() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("kilo");
+    let database = root.join("kilo.db");
+    fs::create_dir_all(&root).unwrap();
+    let _env = EnvVarGuard::set_os(&[("KILO_DATA_DIR", Some(root.as_os_str()))]);
+    crate::sources::kilocode::tests::fixture_db(&database);
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let mut legacy = record(900, "user", "legacy database-wide copy");
+    legacy.source = SourceKind::Kilocode;
+    legacy.source_path = database.to_string_lossy().into_owned();
+    legacy.session_id = "ses_main".into();
+    drop(save_search_records(&paths, &[legacy]));
+    IngestState {
+        next_doc_id: 901,
+        files: HashMap::from([(
+            database.to_string_lossy().into_owned(),
+            FileState {
+                size: 0,
+                mtime: 0,
+                offset: 0,
+                turn_id: 0,
+                legacy_turn_id: None,
+                parser_version: 1,
+                pending_tool_calls: HashMap::new(),
+                identity: FileIdentity::default(),
+                claude_background: None,
+                codex_metadata_offsets: None,
+            },
+        )]),
+        ..IngestState::default()
+    }
+    .save_with_lease(&paths.state.join("ingest.json"), &lease)
+    .unwrap();
+    let mut options = ingest_options(false, ModelChoice::potion());
+    options.include_kilocode = true;
+    let run = |options: &IngestOptions| {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, options, &lease).unwrap()
+    };
+    run(&options);
+    assert!(!indexed_texts(&paths).contains(&"legacy database-wide copy".to_string()));
+    let state = IngestState::load(&paths.state.join("ingest.json")).unwrap();
+    assert_eq!(state.files.len(), 2);
+    assert!(!state.files.contains_key(database.to_str().unwrap()));
+    let reader =
+        crate::state::checkpoint::CheckpointReader::open(&paths.state.join("ingest.json")).unwrap();
+    assert_eq!(
+        reader.kilocode_database_paths().unwrap(),
+        HashSet::from([database.to_string_lossy().into_owned()])
+    );
+    options.exclude_patterns = vec![
+        crate::sources::kilocode::virtual_path(&database, "ses_main")
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    run(&options);
+    assert_eq!(indexed_texts(&paths), ["child answer"]);
     options.exclude_patterns = vec![database.to_string_lossy().into_owned()];
     run(&options);
     assert!(indexed_texts(&paths).is_empty());

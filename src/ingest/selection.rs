@@ -29,12 +29,14 @@ enum Shape {
     OpenClaw,
     Copilot,
     Grok,
+    Hermes,
     Jcode,
     Muse,
     Antigravity,
     Bob,
     Zcode,
     Kiro,
+    Kilocode,
 }
 
 struct Root {
@@ -116,6 +118,13 @@ fn roots(options: &IngestOptions) -> Vec<Root> {
     if options.include_grok {
         roots.push(Root::new(sources::grok::session_root(), Shape::Grok));
     }
+    if options.include_hermes {
+        roots.extend(
+            sources::hermes::profile_roots()
+                .into_iter()
+                .map(|root| Root::new(root, Shape::Hermes)),
+        );
+    }
     if options.include_jcode {
         roots.push(Root::new(sources::jcode::sessions_root(), Shape::Jcode));
     }
@@ -143,6 +152,13 @@ fn roots(options: &IngestOptions) -> Vec<Root> {
             sources::zcode::db_dirs()
                 .into_iter()
                 .map(|root| Root::new(root, Shape::Zcode)),
+        );
+    }
+    if options.include_kilocode {
+        roots.extend(
+            sources::kilocode::db_dirs()
+                .into_iter()
+                .map(|root| Root::new(root, Shape::Kilocode)),
         );
     }
     roots
@@ -229,6 +245,9 @@ fn classify(root: &Root, path: &Path) -> Match {
             }
             ((2..=3).contains(&parts.len()) && name == "updates.jsonl").then_some(SourceKind::Grok)
         }
+        Shape::Hermes => {
+            sources::hermes::is_database_in_root(&root.lexical, path).then_some(SourceKind::Hermes)
+        }
         Shape::Jcode => {
             (name.starts_with("session_") && name.ends_with(".json")).then_some(SourceKind::Jcode)
         }
@@ -248,6 +267,15 @@ fn classify(root: &Root, path: &Path) -> Match {
             // One store per db directory; `resolve` routes WAL and shared-memory
             // sidecar hints to the database before classification.
             return if parts.len() == 1 && name == "db.sqlite" {
+                Match::Database(path.to_path_buf())
+            } else {
+                Match::Ignore
+            };
+        }
+        Shape::Kilocode => {
+            // One store per data root; `resolve` routes WAL and shared-memory
+            // sidecar hints to the database before classification.
+            return if parts.len() == 1 && name == "kilo.db" {
                 Match::Database(path.to_path_buf())
             } else {
                 Match::Ignore
@@ -289,10 +317,25 @@ fn resolve(
     let mut files = Vec::new();
     let mut databases = Vec::new();
     for hint in dirty {
+        let hermes_database_hint = hint
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| {
+                name.strip_suffix("-wal")
+                    .or_else(|| name.strip_suffix("-journal"))
+            })
+            .map(|name| hint.with_file_name(name));
         let mut matches = Vec::new();
         let mut known_unmatched = false;
         for root in roots {
-            let Some(mut path) = root.remap(hint) else {
+            // Normalize before remapping: a configured root can be the database
+            // file itself, with the WAL beside it rather than beneath it.
+            let lookup = if matches!(root.shape, Shape::Hermes) {
+                hermes_database_hint.as_deref().unwrap_or(hint)
+            } else {
+                hint
+            };
+            let Some(mut path) = root.remap(lookup) else {
                 continue;
             };
             if matches!(root.shape, Shape::Kiro)
@@ -337,6 +380,16 @@ fn resolve(
                             .or_else(|| name.strip_suffix("-shm"))
                     })
                     .filter(|name| *name == "db.sqlite")
+                    .map(|name| path.with_file_name(name))
+                    .unwrap_or(path),
+                Shape::Kilocode => path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| {
+                        name.strip_suffix("-wal")
+                            .or_else(|| name.strip_suffix("-shm"))
+                    })
+                    .filter(|name| *name == "kilo.db")
                     .map(|name| path.with_file_name(name))
                     .unwrap_or(path),
                 _ => path,
@@ -398,6 +451,8 @@ fn resolve(
                         SourceKind::Bob
                     } else if matches!(root.shape, Shape::Zcode) {
                         SourceKind::Zcode
+                    } else if matches!(root.shape, Shape::Kilocode) {
+                        SourceKind::Kilocode
                     } else {
                         SourceKind::Opencode
                     };
@@ -509,11 +564,13 @@ mod tests {
             include_openclaw: false,
             include_copilot: false,
             include_grok: false,
+            include_hermes: false,
             include_jcode: false,
             include_muse: false,
             include_antigravity: false,
             include_bob: false,
             include_zcode: false,
+            include_kilocode: false,
             include_kiro: false,
             exclude_patterns: Vec::new(),
             embeddings: false,
@@ -539,6 +596,76 @@ mod tests {
             &PathExcluder::build(&[]).unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn hermes_dirty_hints_select_root_and_profile_transcripts() {
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("custom-hermes");
+        let _env = EnvVarGuard::set_os(&[("HERMES_PROFILE_ROOTS", Some(root.as_os_str()))]);
+        let mut options = options();
+        options.include_hermes = true;
+        let state = checkpoint(&temp, &IngestState::default());
+        for relative in ["state.db", "profiles/work/state.db"] {
+            let database = root.join(relative);
+            write(&database);
+            for suffix in ["", "-wal", "-journal"] {
+                let hint = database.with_file_name(format!("state.db{suffix}"));
+                let selection = resolve_dirty(&options, &HashSet::from([hint]), &state).unwrap();
+                let DirtySelection::Paths { files, databases } = selection else {
+                    panic!("expected a targeted Hermes transcript");
+                };
+                assert!(databases.is_empty());
+                assert_eq!(
+                    files,
+                    vec![SourceFile {
+                        source: SourceKind::Hermes,
+                        path: database.clone(),
+                    }]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hermes_profile_directory_hints_match_discovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("profiles");
+        let database = root.join("work/state.db");
+        write(&database);
+        let DirtySelection::Paths { files, databases } =
+            select(&[Root::new(root, Shape::Hermes)], &database)
+        else {
+            panic!("expected a targeted profile transcript");
+        };
+        assert!(databases.is_empty());
+        assert_eq!(
+            files,
+            vec![SourceFile {
+                source: SourceKind::Hermes,
+                path: database
+            }]
+        );
+    }
+
+    #[test]
+    fn hermes_database_file_root_hints_request_resync() {
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("state.db");
+        write(&database);
+        let _env = EnvVarGuard::set_os(&[("HERMES_PROFILE_ROOTS", Some(database.as_os_str()))]);
+        let mut options = options();
+        options.include_hermes = true;
+        let state = checkpoint(&temp, &IngestState::default());
+        for suffix in ["", "-wal"] {
+            let hint = database.with_file_name(format!("state.db{suffix}"));
+            assert!(matches!(
+                resolve_dirty(&options, &HashSet::from([hint]), &state).unwrap(),
+                DirtySelection::Resync
+            ));
+        }
     }
 
     #[test]
@@ -700,6 +827,10 @@ mod tests {
             (Shape::Copilot, "id/notes.jsonl"),
             (Shape::Grok, "updates.jsonl"),
             (Shape::Grok, "a/b/c/updates.jsonl"),
+            (Shape::Hermes, "nested/state.db"),
+            (Shape::Hermes, "profiles/work/nested/state.db"),
+            (Shape::Hermes, "state.db-shm"),
+            (Shape::Hermes, "request.json"),
             (Shape::Jcode, "notes.json"),
             (Shape::Muse, "notes.jsonl"),
             (Shape::Kiro, "project/id/snapshots/messages.jsonl"),

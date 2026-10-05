@@ -1,7 +1,7 @@
 use crate::analytics::{AnalyticsStore, analytics_path, backfill_from_index};
 use crate::config::{Paths, UserConfig, default_claude_sources};
 use crate::embed::{EmbedRuntimeConfig, ModelChoice};
-use crate::index::{IndexRevision, QueryOptions, SearchIndex, SessionScopeKey};
+use crate::index::{IndexRevision, QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, ingest_all, ingest_dirty};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
 use crate::machine::{
@@ -11,7 +11,7 @@ use crate::machine::{
     federated_sessions, federated_usage, read_context, read_memory, read_record,
     read_session_pages, session_page_context,
 };
-use crate::memory::{MemoryFreshness, MemoryStore};
+use crate::memory::MemoryStore;
 use crate::memory_search::{
     MAX_MEMORY_READ_CHARS, MemoryReadRequest, MemoryReadValue, MemorySearchMode,
     MemorySearchOptions, embed_memory, gc_memory_vectors,
@@ -20,8 +20,7 @@ use crate::read_budget::{ContentPage, DEFAULT_MAX_CHARS, ReadBudget, ReadField};
 use crate::retrieval::canonical_record_id;
 use crate::retrieval::{ContextOptions, ContextSelector};
 use crate::retrieval_eval::{
-    EvaluationDataset, RetrievalTrace, RetrievalTraceMetadata, TraceQuery, append_trace,
-    fuse_ranked_queries, mean_reciprocal_rank, ndcg_at_k, recall_at_k, unique_sessions_at_k,
+    RetrievalTrace, RetrievalTraceMetadata, TraceQuery, append_trace, fuse_ranked_queries,
 };
 use crate::transfer::{
     TransferMode as CoreTransferMode, TransferOptions, TransferTarget as CoreTransferTarget,
@@ -30,7 +29,6 @@ use crate::transfer::{
 use crate::tui;
 use crate::types::{RecordLinks, SourceFilter};
 use crate::usage::{CostMode, UsageQuery, scan_usage};
-use crate::vector::VectorIndex;
 use crate::watch::WatchMode;
 use crate::watch::{WatchService, watch_roots};
 use anyhow::{Context, Result, anyhow};
@@ -54,10 +52,12 @@ use std::time::Instant;
 use toml_edit::{DocumentMut, Item as TomlItem, value};
 
 mod daemon_upgrade;
+mod evaluation;
+mod stats;
 mod surface;
 use surface::{
-    CliSearchMode, DaemonMcpArgs, DebugCommand, IndexCommand, IndexSource, OutputArgs,
-    OutputFormat, OutputOptions, SessionCommand, WebCommand,
+    CliSearchMode, DaemonMcpArgs, DebugCommand, EvaluationArgs, IndexCommand, IndexSource,
+    OutputArgs, OutputFormat, OutputOptions, SessionCommand, WebCommand,
 };
 
 static TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -157,6 +157,12 @@ struct IndexArgs {
     /// Skip indexing Grok sessions
     #[arg(long = "no-grok", default_value_t = false, hide = true)]
     no_grok: bool,
+    /// Index Hermes sessions from state.db [default: true]
+    #[arg(long, default_value_t = true, hide = true)]
+    hermes: bool,
+    /// Skip indexing Hermes sessions
+    #[arg(long = "no-hermes", default_value_t = false, hide = true)]
+    no_hermes: bool,
     /// Index Jcode sessions from ~/.jcode/sessions [default: true]
     #[arg(long, default_value_t = true, hide = true)]
     jcode: bool,
@@ -193,13 +199,19 @@ struct IndexArgs {
     /// Skip indexing ZCode sessions
     #[arg(long = "no-zcode", default_value_t = false, hide = true)]
     no_zcode: bool,
+    /// Index KiloCode CLI sessions from ~/.local/share/kilo/kilo.db [default: true]
+    #[arg(long, default_value_t = true, hide = true)]
+    kilocode: bool,
+    /// Skip indexing KiloCode CLI sessions
+    #[arg(long = "no-kilocode", default_value_t = false, hide = true)]
+    no_kilocode: bool,
     /// Generate embeddings for semantic search during indexing
     #[arg(long, help_heading = "Embeddings")]
     embeddings: bool,
     /// Skip embedding generation (overrides config default)
     #[arg(long, help_heading = "Embeddings")]
     no_embeddings: bool,
-    /// Embedding model: minilm (fast), bge, nomic, gemma (default, best quality), potion (tiny)
+    /// Embedding model: minilm, bge, nomic, gemma (default), potion, a fastembed model name, or remote:<model>
     #[arg(long, help_heading = "Embeddings")]
     model: Option<String>,
     /// Path to memex data directory [default: ~/.memex]
@@ -285,7 +297,7 @@ EXAMPLES:
     /// Generate embeddings for semantic search (requires existing index)
     #[command(hide = true)]
     Embed {
-        /// Embedding model: minilm (fast), bge, nomic, gemma (default, best quality), potion (tiny)
+        /// Embedding model: minilm, bge, nomic, gemma (default), potion, a fastembed model name, or remote:<model>
         #[arg(long)]
         model: Option<String>,
         /// Path to memex data directory [default: ~/.memex]
@@ -590,14 +602,8 @@ The input contains at most 32 requests; each page is limited to 500 records."
     /// Run retrieval queries from a JSONL evaluation dataset
     #[command(hide = true)]
     EvalRetrieval {
-        /// JSONL evaluation dataset path
-        dataset: PathBuf,
-        /// Cutoff used for recall and nDCG metrics
-        #[arg(long, default_value_t = 20)]
-        k: usize,
-        /// Path to memex data directory [default: ~/.memex]
-        #[arg(long)]
-        root: Option<PathBuf>,
+        #[command(flatten)]
+        evaluation: EvaluationArgs,
     },
     /// List this machine and enabled configured peers (without connecting)
     Machines {
@@ -710,12 +716,17 @@ EXAMPLES:
         #[command(subcommand)]
         action: HerdrCommand,
     },
-    /// Show index statistics (document count, vector count, storage paths)
+    /// Show index statistics, vector state, and indexing config
     #[command(hide = true)]
     Stats {
+        /// Output stats as JSON (legacy alias for --format json --pretty)
+        #[arg(long, hide = true)]
+        json: bool,
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// Reconstruct local token usage from agent logs
     #[command(after_help = "\
@@ -1742,10 +1753,10 @@ pub fn run() -> Result<()> {
             })?;
         }
         Commands::Debug {
-            action: DebugCommand::EvalRetrieval { dataset, k, root },
+            action: DebugCommand::EvalRetrieval { evaluation },
         }
-        | Commands::EvalRetrieval { dataset, k, root } => {
-            run_eval_retrieval(dataset, k, root)?;
+        | Commands::EvalRetrieval { evaluation } => {
+            evaluation::run(evaluation)?;
         }
         Commands::Machines { root, output } => {
             let paths = Paths::new(root)?;
@@ -1926,8 +1937,11 @@ pub fn run() -> Result<()> {
                 run_herdr_resume(Some(session_id), None, false, source, root)?;
             }
         },
-        Commands::Stats { root } => {
-            run_stats(root)?;
+        Commands::Stats { json, root, output } => {
+            stats::run(
+                root,
+                output.resolve(OutputFormat::Text, json.then_some(OutputFormat::Json), json)?,
+            )?;
         }
         Commands::Usage {
             source,
@@ -2086,6 +2100,7 @@ fn service_embedding_worker(
         vector_work.verify = true;
         vector_work.memory_revision = None;
         vector_work.retry_after = None;
+        vector_work.consecutive_failures = 0;
     }
 
     let search_index = SearchIndex::open_or_create(&paths.index)?;
@@ -2111,7 +2126,7 @@ fn service_embedding_worker(
         let should_spawn = if vector_work.pending {
             true
         } else if vector_work.verify {
-            crate::vector_backfill::needs_work(paths, &search_index, spec.model)?
+            crate::vector_backfill::needs_work(paths, &search_index, &spec.model, &spec.runtime)?
         } else {
             false
         };
@@ -2135,15 +2150,34 @@ struct VectorWorkState {
     verify: bool,
     external_embedding_seen: bool,
     retry_after: Option<Instant>,
+    consecutive_failures: u32,
+}
+
+/// Delay before respawning after the first failed embedding worker.
+const EMBED_WORKER_RETRY_BASE: Duration = Duration::from_secs(5);
+/// Longest delay between respawns of a repeatedly failing embedding worker.
+const EMBED_WORKER_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// Respawn delay after `failures` consecutive failed runs: the base delay doubled per
+/// earlier failure, capped at [`EMBED_WORKER_RETRY_MAX`].
+fn embed_worker_retry_delay(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(31);
+    EMBED_WORKER_RETRY_BASE
+        .saturating_mul(1 << doublings)
+        .min(EMBED_WORKER_RETRY_MAX)
 }
 
 impl VectorWorkState {
     fn worker_finished(&mut self, success: bool) {
         self.verify = true;
-        if !success {
+        if success {
+            self.consecutive_failures = 0;
+        } else {
             // Conversation publication can finish before memory embedding fails.
             self.pending = true;
-            self.retry_after = Some(Instant::now() + Duration::from_secs(5));
+            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            self.retry_after =
+                Some(Instant::now() + embed_worker_retry_delay(self.consecutive_failures));
         }
     }
 
@@ -2262,16 +2296,16 @@ fn retry_after_stopping_embedder<P: ChildProcess, T>(
 fn spawn_embedding_process(index: &IndexArgs, spec: &EmbedWorkerSpec) -> Result<SystemChild> {
     Ok(SystemChild(
         Command::new(std::env::current_exe()?)
-            .args(build_embed_command_args(index, spec.model))
+            .args(build_embed_command_args(index, &spec.model))
             .spawn()?,
     ))
 }
 
-fn build_embed_command_args(index: &IndexArgs, model: ModelChoice) -> Vec<String> {
+fn build_embed_command_args(index: &IndexArgs, model: &ModelChoice) -> Vec<String> {
     let mut args = vec![
         "embed".to_string(),
         "--model".to_string(),
-        model.as_str().to_string(),
+        model.identity().into_owned(),
     ];
     if let Some(root) = &index.root {
         args.push("--root".to_string());
@@ -2320,25 +2354,44 @@ fn run_index_loop(
             None
         }
     };
-    if mode == WatchMode::Poll {
-        run_poll_loop(
-            index,
-            interval_secs,
-            web_listen,
-            mcp,
-            &mut runtime,
-            &mut upgrade,
-        )
-    } else {
-        run_event_loop(
-            index,
-            Duration::from_secs(interval_secs),
-            web_listen,
-            mcp,
-            &mut runtime,
-            &mut upgrade,
-        )
+    let result = (|| {
+        // Reject incompatible indexes before starting listeners or writable staging.
+        SearchIndex::open_or_create(&paths.index)?;
+        if mode == WatchMode::Poll {
+            run_poll_loop(
+                index,
+                interval_secs,
+                web_listen,
+                mcp,
+                &mut runtime,
+                &mut upgrade,
+            )
+        } else {
+            run_event_loop(
+                index,
+                Duration::from_secs(interval_secs),
+                web_listen,
+                mcp,
+                &mut runtime,
+                &mut upgrade,
+            )
+        }
+    })();
+    if let Err(error) = &result
+        && error.is::<crate::index::IndexCompatibilityError>()
+    {
+        runtime.mark_not_ready()?;
+        eprintln!("daemon: indexing paused: {error:#}");
+        eprintln!("daemon: repair the index, then run `memex daemon restart`");
+        // Existing launchd jobs use KeepAlive=true. Stay idle instead of exiting
+        // into a restart loop; an executable replacement can still recover us.
+        let shutdown = watch_shutdown_flag()?;
+        while wait_for_next_index_cycle(Duration::from_secs(1), &shutdown) {
+            upgrade.check(|| Ok(()));
+        }
+        return Ok(());
     }
+    result
 }
 
 fn run_poll_loop(
@@ -2503,6 +2556,9 @@ fn run_event_loop(
                         service.mark_complete(FireCause::Resync);
                         log_watch_stats(&service);
                     }
+                    Err(error) if error.is::<crate::index::IndexCompatibilityError>() => {
+                        return Err(error);
+                    }
                     Err(error) => eprintln!("watch: resync ingest failed, retrying: {error:#}"),
                 }
             }
@@ -2527,18 +2583,25 @@ fn run_event_loop(
                             log_watch_stats(&service);
                         }
                         Err(error) => {
+                            if error.is::<crate::index::IndexCompatibilityError>() {
+                                return Err(error);
+                            }
                             eprintln!("watch: ingest failed, retrying: {error:#}");
                         }
                     },
                     Err(error) => {
                         eprintln!("watch: dirty check failed, ingesting to be safe: {error:#}");
-                        if retry_after_stopping_embedder(&mut worker, || {
+                        match retry_after_stopping_embedder(&mut worker, || {
                             run_index_args(index, false)
-                        })
-                        .is_ok()
-                        {
-                            service.mark_complete(FireCause::Resync);
-                            log_watch_stats(&service);
+                        }) {
+                            Ok(()) => {
+                                service.mark_complete(FireCause::Resync);
+                                log_watch_stats(&service);
+                            }
+                            Err(error) if error.is::<crate::index::IndexCompatibilityError>() => {
+                                return Err(error);
+                            }
+                            Err(error) => eprintln!("watch: ingest failed, retrying: {error:#}"),
                         }
                     }
                 }
@@ -2637,11 +2700,13 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         include_openclaw: index.source_enabled(IndexSource::Openclaw),
         include_copilot: index.source_enabled(IndexSource::Copilot),
         include_grok: index.source_enabled(IndexSource::Grok),
+        include_hermes: index.source_enabled(IndexSource::Hermes),
         include_jcode: index.source_enabled(IndexSource::Jcode),
         include_muse: index.source_enabled(IndexSource::Muse),
         include_antigravity: index.source_enabled(IndexSource::Antigravity),
         include_bob: index.source_enabled(IndexSource::Bob),
         include_zcode: index.source_enabled(IndexSource::Zcode),
+        include_kilocode: index.source_enabled(IndexSource::Kilocode),
         include_kiro: index.source_enabled(IndexSource::Kiro),
         exclude_patterns: excludes,
         embeddings,
@@ -2678,8 +2743,8 @@ fn run_index_selection(
     let index = if reindex {
         SearchIndex::open_or_create_for_rebuild(&paths.index)?
     } else {
-        match SearchIndex::open_or_create(&paths.index) {
-            Ok(index) if !index.is_writable() => index,
+        match SearchIndex::open_or_create(&paths.index)? {
+            index if !index.is_writable() => index,
             _ => SearchIndex::open_or_create_for_search_refresh(&paths.index)?,
         }
     };
@@ -2904,11 +2969,16 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
     let report = crate::vector_backfill::run_with_lease(
         &paths,
         &index,
-        model_choice,
+        &model_choice,
         &embed_runtime,
         &lease,
     )?;
-    let memory_embedded = embed_memory(&paths, model_choice, &embed_runtime)?;
+    let memory_embedded = embed_memory(
+        &paths,
+        &model_choice,
+        &embed_runtime,
+        Some(report.dimensions),
+    )?;
     println!("embedded {memory_embedded} memory section vectors");
     println!(
         "embedded {} vectors ({} total, {} resumed from checkpoints)",
@@ -4535,83 +4605,6 @@ fn hydrate_error_value(machine: &str, request: &SessionPageRequest, error: &str)
     })?)
 }
 
-fn run_eval_retrieval(dataset_path: PathBuf, k: usize, root: Option<PathBuf>) -> Result<()> {
-    let dataset = EvaluationDataset::read_jsonl(&dataset_path)?;
-    let paths = Paths::new(root)?;
-    let index = SearchIndex::open_or_create(&paths.index)?;
-    let mut result_lists = Vec::with_capacity(dataset.cases.len());
-    for case in &dataset.cases {
-        let scope = case
-            .cwd
-            .as_deref()
-            .map(|cwd| session_scope_for_cwd(&paths, cwd))
-            .transpose()?
-            .flatten();
-        let mut ranked = Vec::new();
-        for query in case.query_views()? {
-            let options = QueryOptions {
-                query,
-                project: None,
-                role: None,
-                tool: None,
-                session_id: None,
-                session_scope: scope.clone(),
-                source: None,
-                since: None,
-                until: None,
-                limit: k.max(20),
-            };
-            ranked.push(
-                index
-                    .search(&options)?
-                    .into_iter()
-                    .map(|(score, record)| LocatedRecord {
-                        machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
-                        score,
-                        record,
-                    })
-                    .collect(),
-            );
-        }
-        result_lists.push(fuse_ranked_queries(
-            ranked,
-            crate::retrieval_eval::DEFAULT_RRF_K,
-        ));
-    }
-    let mrr = mean_reciprocal_rank(&result_lists, &dataset.cases)?;
-    let ndcg = dataset
-        .cases
-        .iter()
-        .zip(&result_lists)
-        .map(|(case, results)| ndcg_at_k(results, &case.relevant, k))
-        .sum::<f64>()
-        / dataset.cases.len() as f64;
-    let recall = dataset
-        .cases
-        .iter()
-        .zip(&result_lists)
-        .map(|(case, results)| recall_at_k(results, &case.relevant, k))
-        .sum::<f64>()
-        / dataset.cases.len() as f64;
-    let unique_sessions = result_lists
-        .iter()
-        .map(|results| unique_sessions_at_k(results, k))
-        .sum::<usize>() as f64
-        / dataset.cases.len() as f64;
-    println!(
-        "{}",
-        serde_json::json!({
-            "cases": dataset.cases.len(),
-            "k": k,
-            "mrr": mrr,
-            "recall_at_k": recall,
-            "ndcg_at_k": ndcg,
-            "mean_unique_sessions_at_k": unique_sessions,
-        })
-    );
-    Ok(())
-}
-
 struct SessionRunArgs {
     session_id: String,
     machine: String,
@@ -4931,32 +4924,6 @@ fn hydrate_session_records(
         next_offset = context.next_offset.expect("checked above");
     }
     Ok(records)
-}
-
-fn run_stats(root: Option<PathBuf>) -> Result<()> {
-    let paths = Paths::new(root)?;
-    let index = SearchIndex::open_or_create(&paths.index)?;
-    let memory = MemoryStore::new(paths.root.join("memory/documents.json")).load()?;
-    let memory_sections = memory
-        .documents
-        .iter()
-        .map(|document| document.sections.len())
-        .sum::<usize>();
-    let stale_memories = memory
-        .documents
-        .iter()
-        .filter(|document| matches!(document.freshness, MemoryFreshness::Stale { .. }))
-        .count();
-    println!("index: {}", paths.index.display());
-    println!("documents: {}", index.doc_count()?);
-    if let Some(status) = crate::vector_backfill::status(&paths)? {
-        println!("{}", status.line());
-    }
-    println!("memory documents: {}", memory.documents.len());
-    println!("memory sections: {memory_sections}");
-    println!("stale memory documents: {stale_memories}");
-    print_vector_stats(&paths.vectors)?;
-    Ok(())
 }
 
 struct UsageCommandOptions {
@@ -5329,24 +5296,6 @@ pub(crate) fn canonical_cwd_filter(cwd: Option<PathBuf>) -> Option<String> {
     Some(resolved.to_string_lossy().to_string())
 }
 
-fn session_scope_for_cwd(paths: &Paths, cwd: &str) -> Result<Option<Vec<SessionScopeKey>>> {
-    let db = analytics_path(&paths.state);
-    if !db.exists() {
-        return Ok(Some(Vec::new()));
-    }
-    let store = AnalyticsStore::open_read_only(db)?;
-    let rows = store.query_sessions_detailed(None, None, Some(cwd), None, None)?;
-    Ok(Some(
-        rows.into_iter()
-            .map(|row| SessionScopeKey {
-                source: row.source,
-                session_id: row.session_id,
-                source_path: row.source_path,
-            })
-            .collect(),
-    ))
-}
-
 struct TraceWriteArgs<'a> {
     paths: &'a Paths,
     queries: &'a [String],
@@ -5424,7 +5373,9 @@ pub(crate) fn session_resume_command(
 ) -> Option<(String, String)> {
     let template = crate::resume::resume_template(config, row.source, false)?;
     let source_dir = source_dir_of(&row.source_path);
-    let cwd = row.cwd.clone().unwrap_or_else(|| source_dir.clone());
+    // Transcript stores are never workspaces: falling back into one makes the
+    // resumed CLI ask the user to trust an agent's internal state directory.
+    let cwd = crate::resume::resume_cwd(row.cwd.clone(), &source_dir);
     let command = crate::resume::expand_resume_template(
         &template,
         &crate::resume::ResumeSession {
@@ -5758,27 +5709,6 @@ fn run_analytics_backfill(root: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn print_vector_stats(vectors_dir: &std::path::Path) -> Result<()> {
-    println!("{}", vector_stats_line(vectors_dir)?);
-    Ok(())
-}
-
-fn vector_stats_line(vectors_dir: &std::path::Path) -> Result<String> {
-    let Some(inventory) = VectorIndex::inventory(vectors_dir)? else {
-        return Ok("vectors: none".to_string());
-    };
-    let model = inventory.model.as_deref().unwrap_or("unknown");
-    Ok(format!(
-        "vectors: {} (dims {}, model {}, ids {}, usearch.index {}, doc_ids.bin {})",
-        inventory.vector_count,
-        inventory.dimensions,
-        model,
-        inventory.doc_ids.len(),
-        inventory.index_bytes,
-        inventory.ids_bytes
-    ))
-}
-
 const MEMEX_SEARCH_SKILL: &str = include_str!("../skills/memex-search/SKILL.md");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6100,6 +6030,7 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
         crate::types::SourceKind::Bob => "bob",
         crate::types::SourceKind::Zcode => "zcode",
         crate::types::SourceKind::Kiro => "kiro",
+        crate::types::SourceKind::Kilocode => "kilocode",
     };
     let source_path = &record.source_path;
     if record.source == crate::types::SourceKind::Bob {
@@ -6110,6 +6041,11 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
     if record.source == crate::types::SourceKind::Zcode {
         return Err(anyhow!(
             "sharing is not supported for ZCode sessions: {source_path} is a database, not a transcript file"
+        ));
+    }
+    if record.source == crate::types::SourceKind::Kilocode {
+        return Err(anyhow!(
+            "sharing is not supported for KiloCode sessions: {source_path} is a database, not a transcript file"
         ));
     }
 
@@ -7434,6 +7370,9 @@ fn build_index_command_args(
     if !index.jcode || index.no_jcode {
         args.push("--no-jcode".to_string());
     }
+    if !index.hermes || index.no_hermes {
+        args.push("--no-hermes".to_string());
+    }
     if !index.kiro || index.no_kiro {
         args.push("--no-kiro".to_string());
     }
@@ -7445,6 +7384,9 @@ fn build_index_command_args(
     }
     if !index.zcode || index.no_zcode {
         args.push("--no-zcode".to_string());
+    }
+    if !index.kilocode || index.no_kilocode {
+        args.push("--no-kilocode".to_string());
     }
     if let Some(listen) = mcp_listen {
         args.push("--mcp".to_string());
@@ -8061,8 +8003,6 @@ fn resolve_flag(default: bool, enable: bool, disable: bool, name: &str) -> Resul
 
 const REPO: &str = "nicosuave/memex";
 
-const HOMEBREW_FORMULA: &str = "nicosuave/tap/memex";
-
 fn interaction_allowed(
     explicitly_disabled: bool,
     stdin_tty: bool,
@@ -8097,17 +8037,51 @@ fn homebrew_executable(path: &Path) -> bool {
         .any(|pair| pair[0].as_os_str() == "Cellar" && pair[1].as_os_str() == "memex")
 }
 
-fn is_homebrew_install() -> bool {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.canonicalize().ok())
-        .is_some_and(|path| homebrew_executable(&path))
+// The receipt preserves ownership when core and a third-party tap both contain memex.
+fn homebrew_formula(current_exe: &Path) -> Result<String> {
+    let keg = current_exe
+        .parent()
+        .and_then(Path::parent)
+        .context("Homebrew binary has no installation directory")?;
+    let receipt_path = keg.join("INSTALL_RECEIPT.json");
+    let receipt = std::fs::read(&receipt_path).with_context(|| {
+        format!(
+            "read Homebrew installation receipt {}",
+            receipt_path.display()
+        )
+    })?;
+    let receipt: serde_json::Value = serde_json::from_slice(&receipt)
+        .context("parse Homebrew installation receipt; use brew to upgrade manually")?;
+    let tap = receipt
+        .pointer("/source/tap")
+        .and_then(serde_json::Value::as_str)
+        .context("Homebrew installation receipt has no source tap; use brew to upgrade manually")?;
+    let parts: Vec<_> = tap.split('/').collect();
+    anyhow::ensure!(
+        parts.len() == 2
+            && parts.iter().all(|part| {
+                part.bytes()
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric())
+                    && part.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    })
+            }),
+        "Homebrew installation receipt has an invalid source tap; use brew to upgrade manually"
+    );
+    if tap == "homebrew/core" {
+        Ok("memex".to_string())
+    } else {
+        Ok(format!("{tap}/memex"))
+    }
 }
 
 fn confirm_update() -> Result<bool> {
     use dialoguer::{Confirm, theme::ColorfulTheme};
-    if is_homebrew_install() {
-        eprintln!("brew update && brew upgrade {HOMEBREW_FORMULA}");
+    let current_exe = std::env::current_exe()?.canonicalize()?;
+    if homebrew_executable(&current_exe) {
+        let formula = homebrew_formula(&current_exe)?;
+        eprintln!("brew update && brew upgrade {formula}");
     }
     eprintln!(
         "Existing memex-search skill copies will also be replaced with the installed version; missing copies stay uninstalled."
@@ -8145,8 +8119,8 @@ fn activate_installed_daemon(binary: &Path) -> Result<()> {
     Ok(())
 }
 
-fn update_homebrew(brew: &Path, expected_version: Option<&str>) -> Result<PathBuf> {
-    for args in [vec!["update"], vec!["upgrade", HOMEBREW_FORMULA]] {
+fn update_homebrew(brew: &Path, formula: &str, expected_version: Option<&str>) -> Result<PathBuf> {
+    for args in [vec!["update"], vec!["upgrade", formula]] {
         let status = std::process::Command::new(brew)
             .args(&args)
             .env("HOMEBREW_NO_AUTO_UPDATE", "1")
@@ -8162,13 +8136,13 @@ fn update_homebrew(brew: &Path, expected_version: Option<&str>) -> Result<PathBu
     }
     // The running executable can live in an old Cellar version that brew just removed.
     let output = std::process::Command::new(brew)
-        .args(["--prefix", HOMEBREW_FORMULA])
+        .args(["--prefix", formula])
         .stdin(std::process::Stdio::null())
         .output()
         .context("locate the installed Homebrew memex")?;
     if !output.status.success() {
         return Err(anyhow!(
-            "Homebrew upgrade finished, but `brew --prefix {HOMEBREW_FORMULA}` failed; run `memex skill update` after resolving the installation"
+            "Homebrew upgrade finished, but `brew --prefix {formula}` failed; run `memex skill update` after resolving the installation"
         ));
     }
     let prefix = std::str::from_utf8(&output.stdout)
@@ -8200,7 +8174,7 @@ fn update_homebrew(brew: &Path, expected_version: Option<&str>) -> Result<PathBu
     refresh_installed_skills(&binary)?;
     if expected_version.is_some_and(|latest| is_newer_version(installed_version, latest)) {
         return Err(anyhow!(
-            "Homebrew still provides memex v{installed_version}; release v{} is newer. The tap may not have caught up or the formula may be pinned. Installed skills were refreshed; retry `memex update` later",
+            "Homebrew still provides memex v{installed_version}; release v{} is newer. The formula may not have caught up or may be pinned. Installed skills were refreshed; retry `memex update` later",
             expected_version.unwrap()
         ));
     }
@@ -8288,7 +8262,8 @@ fn perform_update(known_latest: Option<&str>) -> Result<()> {
         let brew = find_in_path("brew").ok_or_else(|| {
             anyhow!("Homebrew manages this installation, but brew is not on PATH")
         })?;
-        update_homebrew(&brew, known_latest)?;
+        let formula = homebrew_formula(&current_exe)?;
+        update_homebrew(&brew, &formula, known_latest)?;
     } else {
         let fetched;
         let latest = match known_latest {
@@ -8451,8 +8426,57 @@ fn parse_version_parts(value: &str) -> Option<(u64, u64, u64)> {
 mod tests {
     use super::*;
     use crate::test_support::{EnvVarGuard, env_lock};
-    use crate::vector::VectorIndex;
     use tempfile::TempDir;
+
+    #[test]
+    fn remote_model_override_applies_to_embed_index_and_worker() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(&[("MEMEX_MODEL", None)]);
+        for model_setting in ["", "model = \"\"\n"] {
+            let temp = TempDir::new().unwrap();
+            let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+            std::fs::write(
+                paths.root.join("config.toml"),
+                format!(
+                    "{model_setting}embeddings = \"remote\"\n\
+                     embedding_base_url = \"http://127.0.0.1:9/v1\"\n\
+                     embedding_dimensions = 8\n"
+                ),
+            )
+            .unwrap();
+            let model_name = "text-embedding-3-small";
+            let cli = Cli::try_parse_from([
+                "memex",
+                "index",
+                "--model",
+                model_name,
+                "--root",
+                paths.root.to_str().unwrap(),
+                "--only-source",
+                "claude",
+                "--claude-path",
+                paths.root.to_str().unwrap(),
+            ])
+            .unwrap();
+            let Some(Commands::Index { index, .. }) = cli.command else {
+                panic!("expected index command");
+            };
+            let config = UserConfig::load(&paths).unwrap();
+            let expected = ModelChoice::remote(model_name).unwrap();
+            let options = build_ingest_options(&index, &config).unwrap();
+            assert_eq!(options.model, expected);
+            assert!(options.embed_runtime.remote.is_some());
+            let worker = load_embed_worker_spec(&index, &paths).unwrap().unwrap();
+            assert_eq!(worker.model, expected);
+            assert_eq!(worker.runtime, options.embed_runtime);
+
+            // An empty corpus with a configured size needs no remote request.
+            run_embed(Some(model_name.to_string()), Some(paths.root.clone())).unwrap();
+            let vectors = crate::vector::VectorIndex::open(&paths.vectors).unwrap();
+            assert_eq!(vectors.model(), Some("remote:text-embedding-3-small"));
+            assert_eq!(vectors.dimensions(), 8);
+        }
+    }
 
     #[test]
     fn failed_worker_requeues_memory_work_with_retry_delay() {
@@ -8466,6 +8490,32 @@ mod tests {
         assert!(completed.verify);
         assert!(!completed.pending);
         assert!(completed.retry_after.is_none());
+    }
+
+    #[test]
+    fn embed_worker_retry_delay_doubles_to_a_cap() {
+        let delays = (1..=8)
+            .map(|failures| embed_worker_retry_delay(failures).as_secs())
+            .collect::<Vec<_>>();
+        assert_eq!(delays, [5, 10, 20, 40, 80, 160, 300, 300]);
+        assert_eq!(embed_worker_retry_delay(0), Duration::from_secs(5));
+        assert_eq!(embed_worker_retry_delay(u32::MAX), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn successful_worker_resets_retry_backoff() {
+        let mut state = VectorWorkState::default();
+        for _ in 0..3 {
+            state.worker_finished(false);
+        }
+        assert_eq!(state.consecutive_failures, 3);
+        let deadline = state.retry_after.expect("retry deadline");
+        assert!(deadline > Instant::now() + Duration::from_secs(15));
+        state.worker_finished(true);
+        assert_eq!(state.consecutive_failures, 0);
+        state.worker_finished(false);
+        let deadline = state.retry_after.expect("retry deadline");
+        assert!(deadline <= Instant::now() + Duration::from_secs(5));
     }
 
     #[test]
@@ -8971,12 +9021,16 @@ mod tests {
             no_openclaw: false,
             no_copilot: false,
             no_grok: false,
+            hermes: true,
+            no_hermes: false,
             no_jcode: false,
             no_muse: false,
             no_antigravity: false,
             no_bob: false,
             zcode: false,
             no_zcode: false,
+            kilocode: false,
+            no_kilocode: false,
             kiro: false,
             no_kiro: false,
             embeddings: false,
@@ -9037,12 +9091,16 @@ mod tests {
             no_openclaw: false,
             no_copilot: false,
             no_grok: false,
+            hermes: true,
+            no_hermes: false,
             no_jcode: false,
             no_muse: false,
             no_antigravity: false,
             no_bob: false,
             zcode: false,
             no_zcode: false,
+            kilocode: false,
+            no_kilocode: false,
             kiro: true,
             no_kiro: false,
             embeddings: false,
@@ -9096,12 +9154,16 @@ mod tests {
             no_openclaw: false,
             no_copilot: false,
             no_grok: false,
+            hermes: true,
+            no_hermes: false,
             no_jcode: false,
             no_muse: false,
             no_antigravity: false,
             no_bob: false,
             zcode: false,
             no_zcode: false,
+            kilocode: false,
+            no_kilocode: false,
             kiro: true,
             no_kiro: false,
             embeddings: false,
@@ -9157,12 +9219,16 @@ mod tests {
             no_openclaw: false,
             no_copilot: false,
             no_grok: false,
+            hermes: true,
+            no_hermes: false,
             no_jcode: false,
             no_muse: false,
             no_antigravity: false,
             no_bob: false,
             zcode: false,
             no_zcode: false,
+            kilocode: false,
+            no_kilocode: false,
             kiro: true,
             no_kiro: false,
             embeddings: false,
@@ -9841,33 +9907,6 @@ arguments = {
         assert_eq!(mcp.listen, mcp_listen);
     }
 
-    fn make_vector(dims: usize) -> Vec<f32> {
-        (0..dims).map(|i| (i as f32).sin()).collect()
-    }
-
-    #[test]
-    fn vector_stats_line_reports_current_usearch_store() {
-        let tmp = TempDir::new().unwrap();
-        let mut index = VectorIndex::open_or_create(tmp.path(), 64, Some("bge")).unwrap();
-        index.add(42, &make_vector(64)).unwrap();
-        index.save().unwrap();
-
-        let line = vector_stats_line(tmp.path()).unwrap();
-
-        assert!(line.starts_with("vectors: 1 (dims 64, model bge, ids 1,"));
-        assert!(line.contains("usearch.index"));
-        assert!(line.contains("doc_ids.bin"));
-        assert!(!line.contains("vectors.f32"));
-        assert!(!line.contains("doc_ids.u64"));
-    }
-
-    #[test]
-    fn vector_stats_line_reports_none_without_vector_store() {
-        let tmp = TempDir::new().unwrap();
-
-        assert_eq!(vector_stats_line(tmp.path()).unwrap(), "vectors: none");
-    }
-
     #[test]
     fn index_args_accept_negative_source_flags() {
         let cli = Cli::try_parse_from([
@@ -10160,11 +10199,11 @@ arguments = {
 
         let eval = Cli::try_parse_from(["memex", "eval-retrieval", "dataset.jsonl", "--k", "50"])
             .expect("parse retrieval evaluation command");
-        let Some(Commands::EvalRetrieval { dataset, k, .. }) = eval.command else {
+        let Some(Commands::EvalRetrieval { evaluation }) = eval.command else {
             panic!("expected eval-retrieval command");
         };
-        assert_eq!(dataset, PathBuf::from("dataset.jsonl"));
-        assert_eq!(k, 50);
+        assert_eq!(evaluation.dataset, PathBuf::from("dataset.jsonl"));
+        assert_eq!(evaluation.k, 50);
     }
 
     #[test]

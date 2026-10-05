@@ -24,7 +24,10 @@ use tantivy::directory::{
     Directory, DirectoryLock, FileHandle, Lock, MmapDirectory, WatchCallback, WatchHandle, WritePtr,
 };
 use tantivy::merge_policy::{LogMergePolicy, NoMergePolicy};
-use tantivy::query::{AllQuery, BooleanQuery, EmptyQuery, Occur, Query, RangeQuery, TermQuery};
+use tantivy::query::{
+    AllQuery, BooleanQuery, BoostQuery, ConstScoreQuery, EmptyQuery, Occur, Query, RangeQuery,
+    TermQuery,
+};
 use tantivy::schema::Value;
 use tantivy::schema::{
     FAST, Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder,
@@ -121,15 +124,36 @@ struct PendingGeneration {
     published: AtomicBool,
     _staging_lease: Arc<GenerationLease>,
     directory: storage::SharedDirectory,
+    _cleanup: StagingCleanup,
 }
 
-impl Drop for PendingGeneration {
+#[derive(Debug)]
+struct StagingCleanup {
+    staging_dir: PathBuf,
+    segment_owner: PathBuf,
+}
+
+impl Drop for StagingCleanup {
     fn drop(&mut self) {
-        if !self.published.load(AtomicOrdering::Acquire) {
-            let _ = fs::remove_dir_all(&self.staging_dir);
+        // After the generation rename, CURRENT may already reference this owner even
+        // if a later publication sync failed. Only an unrenamed staging directory
+        // can be discarded, and inherited owners belong to other generations.
+        if self.staging_dir.exists() && fs::remove_dir_all(&self.staging_dir).is_ok() {
+            let _ = fs::remove_dir_all(&self.segment_owner);
         }
     }
 }
+
+#[derive(Debug)]
+pub(crate) struct IndexCompatibilityError(String);
+
+impl std::fmt::Display for IndexCompatibilityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for IndexCompatibilityError {}
 
 /// Tantivy normally takes a metadata lock every time it opens segment readers so its own
 /// garbage collector cannot remove a segment concurrently. Published generations are immutable,
@@ -214,6 +238,60 @@ pub struct SessionScopeKey {
 }
 
 type SessionScopeIdentity = (crate::types::SourceKind, String, String);
+
+struct DocIdCollector;
+
+struct DocIdSegmentCollector {
+    doc_ids: Arc<dyn tantivy::columnar::ColumnValues<u64>>,
+    matches: Vec<u64>,
+}
+
+impl Collector for DocIdCollector {
+    type Fruit = HashSet<u64>;
+    type Child = DocIdSegmentCollector;
+
+    fn for_segment(
+        &self,
+        _segment_local_id: u32,
+        segment: &SegmentReader,
+    ) -> tantivy::Result<Self::Child> {
+        Ok(DocIdSegmentCollector {
+            doc_ids: segment
+                .fast_fields()
+                .u64("doc_id")?
+                // Preserve the missing-value behavior of the former ascending TopDocs collector.
+                .first_or_default_col(u64::MAX),
+            matches: Vec::new(),
+        })
+    }
+
+    fn requires_scoring(&self) -> bool {
+        false
+    }
+
+    fn merge_fruits(&self, segment_fruits: Vec<Vec<u64>>) -> tantivy::Result<Self::Fruit> {
+        // Buffer only IDs so the final set can be sized once, without a count query
+        // or growing and then rehashing a separate set for every segment.
+        let count = segment_fruits.iter().map(Vec::len).sum();
+        let mut matches = HashSet::with_capacity(count);
+        for segment in segment_fruits {
+            matches.extend(segment);
+        }
+        Ok(matches)
+    }
+}
+
+impl SegmentCollector for DocIdSegmentCollector {
+    type Fruit = Vec<u64>;
+
+    fn collect(&mut self, doc: DocId, _score: Score) {
+        self.matches.push(self.doc_ids.get_val(doc));
+    }
+
+    fn harvest(self) -> Self::Fruit {
+        self.matches
+    }
+}
 
 struct SessionScopeCollector {
     fields: IndexFields,
@@ -642,20 +720,25 @@ impl SearchIndex {
         let source = current
             .as_deref()
             .or_else(|| dir.join("meta.json").is_file().then_some(dir));
+        if source.is_some() {
+            // Validate before adopting legacy hard links into the shared store.
+            let existing = Self::open_or_create(dir)?;
+            if existing.fields.reader_metadata.is_none() {
+                return Err(stale_schema_error(dir));
+            }
+        }
         fs::create_dir(&staging_dir)?;
+        let cleanup = StagingCleanup {
+            staging_dir: staging_dir.clone(),
+            segment_owner: dir.join("segments").join(&generation_name),
+        };
         #[cfg(target_os = "macos")]
         let durability = storage::StagingDurability::prepare(dir, &staging_dir)?;
         #[cfg(not(target_os = "macos"))]
         create_generation_lease_file(&staging_dir)?;
         let staging_lease = Arc::new(acquire_generation_lease(&staging_dir)?);
         let directory =
-            match storage::SharedDirectory::stage(dir, &staging_dir, source, &generation_name) {
-                Ok(directory) => directory,
-                Err(error) => {
-                    let _ = fs::remove_dir_all(&staging_dir);
-                    return Err(error);
-                }
-            };
+            storage::SharedDirectory::stage(dir, &staging_dir, source, &generation_name)?;
         #[cfg(target_os = "macos")]
         directory.set_durability(durability);
         directory.pin_generation(Arc::clone(&staging_lease));
@@ -668,6 +751,7 @@ impl SearchIndex {
             published: AtomicBool::new(false),
             _staging_lease: staging_lease,
             directory: directory.clone(),
+            _cleanup: cleanup,
         });
         let index = if staging_dir.join("meta.json").exists() {
             let existing = Index::open(directory.clone())?;
@@ -707,6 +791,7 @@ impl SearchIndex {
                 return Err(stale_schema_error(dir));
             }
             let fields = load_fields(index.schema())?;
+            check_term_dictionary_format(&index, &fields, dir)?;
             Ok(Self {
                 index,
                 fields,
@@ -1160,7 +1245,7 @@ impl SearchIndex {
         crate::profiling::span!("lexical.search");
         let reader = self.reader()?;
         let searcher = reader.searcher();
-        let query = build_query(&self.fields, options, &self.index)?;
+        let query = build_relevance_query(&self.fields, options, &self.index)?;
         let top_docs = searcher.search(&query, &TopDocs::with_limit(options.limit))?;
         let mut results = Vec::with_capacity(top_docs.len());
         for (score, addr) in top_docs {
@@ -1299,17 +1384,10 @@ impl SearchIndex {
         let mut filter_options = options.clone();
         filter_options.query.clear();
         let query = build_query(&self.fields, &filter_options, &self.index)?;
-        let count = searcher.search(query.as_ref(), &Count)?;
-        if count == 0 {
-            return Ok(HashSet::new());
-        }
 
         // This query-scoped set trades memory proportional to the filtered lexical matches for
         // native filtered traversal without requesting or re-querying the entire vector corpus.
-        let collector = TopDocs::with_limit(count).order_by_fast_field::<u64>("doc_id", Order::Asc);
-        let doc_ids: Vec<(u64, tantivy::DocAddress)> =
-            searcher.search(query.as_ref(), &collector)?;
-        Ok(doc_ids.into_iter().map(|(doc_id, _)| doc_id).collect())
+        Ok(searcher.search(query.as_ref(), &DocIdCollector)?)
     }
 
     pub fn records_by_session_id(&self, session_id: &str) -> Result<Vec<Record>> {
@@ -2081,10 +2159,10 @@ impl tantivy::collector::CustomSegmentScorer<SessionReverseOrder> for SessionOrd
 }
 
 fn stale_schema_error(dir: &Path) -> anyhow::Error {
-    anyhow!(
+    IndexCompatibilityError(format!(
         "index schema at {} is stale; see docs/vector-migration.md for vector-preserving migration, or explicitly run `memex index rebuild` to discard and rebuild it",
         dir.display()
-    )
+    )).into()
 }
 
 /// Term dictionaries are SSTables; an index written with tantivy's FST dictionaries fails
@@ -2097,10 +2175,10 @@ fn check_term_dictionary_format(index: &Index, fields: &IndexFields, dir: &Path)
     let reader = tantivy::SegmentReader::open(&index.segment(segment))?;
     match reader.inverted_index(fields.text) {
         Ok(_) => Ok(()),
-        Err(error) if error.to_string().contains("dictionary type") => Err(anyhow!(
+        Err(error) if error.to_string().contains("dictionary type") => Err(IndexCompatibilityError(format!(
             "index at {} uses term dictionaries this build cannot read; run `memex index rebuild`",
             dir.display()
-        )),
+        )).into()),
         Err(error) => Err(error.into()),
     }
 }
@@ -2635,6 +2713,85 @@ fn load_fields(schema: Schema) -> Result<IndexFields> {
     })
 }
 
+/// Prefer conversational evidence without removing useful tool results. Full-query
+/// coverage rewards conversational text, rather than echoed tool invocations.
+fn build_relevance_query(
+    fields: &IndexFields,
+    options: &QueryOptions,
+    index: &Index,
+) -> Result<Box<dyn Query>> {
+    use tantivy::query_grammar::{Delimiter, UserInputAst, UserInputLeaf};
+    let base = build_query(fields, options, index)?;
+    if options.query.trim().is_empty() || options.role.is_some() || options.tool.is_some() {
+        return Ok(base);
+    }
+    let conversation_roles = BooleanQuery::new(
+        ["user", "assistant"]
+            .into_iter()
+            .map(|role| {
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(fields.role, role),
+                        IndexRecordOption::Basic,
+                    )) as Box<dyn Query>,
+                )
+            })
+            .collect(),
+    );
+    let role_filter: Box<dyn Query> =
+        Box::new(ConstScoreQuery::new(Box::new(conversation_roles), 0.0));
+    // Add half of the original BM25 score for conversational matches. Role terms
+    // contribute no score, so rare roles cannot dominate the text's relevance.
+    let conversation_match = BooleanQuery::new(vec![
+        (Occur::Must, base.box_clone()),
+        (Occur::Must, role_filter.box_clone()),
+    ]);
+    let mut clauses: Vec<(Occur, Box<dyn Query>)> = vec![
+        (Occur::Must, base),
+        (
+            Occur::Should,
+            Box::new(BoostQuery::new(Box::new(conversation_match), 0.5)),
+        ),
+    ];
+    let Ok(UserInputAst::Clause(children)) = tantivy::query_grammar::parse_query(&options.query)
+    else {
+        return Ok(Box::new(BooleanQuery::new(clauses)));
+    };
+    let plain_terms = children.len() > 1
+        && children.iter().all(|(occur, child)| {
+            if occur.is_some() {
+                return false;
+            }
+            let UserInputAst::Leaf(leaf) = child else {
+                return false;
+            };
+            let UserInputLeaf::Literal(literal) = leaf.as_ref() else {
+                return false;
+            };
+            literal.field_name.is_none()
+                && literal.delimiter == Delimiter::None
+                && literal.slop == 0
+                && !literal.prefix
+        });
+    if !plain_terms {
+        return Ok(Box::new(BooleanQuery::new(clauses)));
+    }
+    let mut parser = tantivy::query::QueryParser::for_index(index, vec![fields.text]);
+    parser.set_conjunction_by_default();
+    let all_terms = BooleanQuery::new(vec![
+        (Occur::Must, parser.parse_query(&options.query)?),
+        (Occur::Must, role_filter),
+    ]);
+    // A full-query match gets its own BM25 contribution in addition to OR retrieval.
+    // This operates before TopDocs truncation, so grouping can see those candidates.
+    clauses.push((
+        Occur::Should,
+        Box::new(BoostQuery::new(Box::new(all_terms), 2.0)),
+    ));
+    Ok(Box::new(BooleanQuery::new(clauses)))
+}
+
 fn build_query(
     fields: &IndexFields,
     options: &QueryOptions,
@@ -2770,7 +2927,7 @@ fn record_from_doc(fields: &IndexFields, doc: &TantivyDocument) -> Record {
     let source_path = get_str(fields.source_path).unwrap_or_default();
     let source = fields
         .source
-        .and_then(&get_str)
+        .and_then(get_str)
         .and_then(|label| crate::types::SourceKind::from_label(&label))
         .unwrap_or_else(|| crate::types::SourceKind::from_path(&source_path));
     Record {
@@ -2797,7 +2954,7 @@ fn record_from_doc(fields: &IndexFields, doc: &TantivyDocument) -> Record {
             source_tool_assistant_uuid: get_str(fields.source_tool_assistant_uuid),
             ..fields
                 .reader_metadata
-                .and_then(&get_str)
+                .and_then(get_str)
                 .and_then(|json| serde_json::from_str(&json).ok())
                 .unwrap_or_default()
         },
@@ -3479,6 +3636,86 @@ mod tests {
     }
 
     #[test]
+    fn filter_doc_ids_collect_all_live_matches_across_segments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create(tmp.path()).unwrap();
+        let mut writer = index.index.writer_with_num_threads(1, 15_000_000).unwrap();
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        let high_id = u64::from(u32::MAX) + 1;
+        for ids in [[0, 7, 8], [7, high_id, u64::MAX]] {
+            for id in ids {
+                index
+                    .add_record(&mut writer, &test_record(id, "indexed text"))
+                    .unwrap();
+            }
+            writer.commit().unwrap();
+        }
+        let mut other = test_record(99, "indexed text");
+        other.project = "other".to_string();
+        index.add_record(&mut writer, &other).unwrap();
+        writer.delete_term(Term::from_field_u64(index.fields.doc_id, 8));
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        assert_eq!(index.segment_count().unwrap(), 3);
+
+        let options = QueryOptions {
+            // Semantic prefilters must ignore lexical text and the result limit.
+            query: "no lexical matches".to_string(),
+            project: Some("memex".to_string()),
+            role: None,
+            tool: None,
+            session_id: None,
+            session_scope: None,
+            source: None,
+            since: None,
+            until: None,
+            limit: 1,
+        };
+        assert_eq!(
+            index.doc_ids_matching_filters(&options).unwrap(),
+            HashSet::from([0, 7, high_id, u64::MAX])
+        );
+        assert!(
+            index
+                .doc_ids_matching_filters(&QueryOptions {
+                    project: Some("missing".to_string()),
+                    ..options.clone()
+                })
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            index
+                .doc_ids_matching_filters(&QueryOptions {
+                    session_scope: Some(Vec::new()),
+                    ..options
+                })
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn filter_doc_ids_preserve_missing_fast_field_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create(tmp.path()).unwrap();
+        let mut writer = index.index.writer_with_num_threads(1, 15_000_000).unwrap();
+        index
+            .add_record(&mut writer, &test_record(1, "indexed text"))
+            .unwrap();
+        let mut missing_id = TantivyDocument::default();
+        missing_id.add_text(index.fields.project, "memex");
+        writer.add_document(missing_id).unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        assert_eq!(
+            searcher.search(&AllQuery, &DocIdCollector).unwrap(),
+            HashSet::from([1, u64::MAX])
+        );
+    }
+
+    #[test]
     fn session_scope_collector_deduplicates_all_matches_with_fast_and_legacy_fields() {
         let tmp = tempfile::tempdir().expect("tempdir");
         for fast_session_identity in [true, false] {
@@ -3995,6 +4232,81 @@ mod tests {
     }
 
     #[test]
+    fn relevance_prefers_full_query_coverage_before_the_candidate_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create(temp.path()).unwrap();
+        let mut writer = index.writer().unwrap();
+        for record in [
+            test_record(1, "museum museum museum museum museum"),
+            test_record(
+                2,
+                "The museum repaired the amber moth exhibit using a reversible resin patch and careful conservation techniques.",
+            ),
+            test_record(3, "moth"),
+        ] {
+            index.add_record(&mut writer, &record).unwrap();
+        }
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        let mut options = QueryOptions {
+            query: "museum amber moth".into(),
+            project: None,
+            role: None,
+            tool: None,
+            session_id: None,
+            session_scope: None,
+            source: None,
+            since: None,
+            until: None,
+            limit: 1,
+        };
+        assert_eq!(index.search(&options).unwrap()[0].1.doc_id, 2);
+        options.limit = 10;
+        assert_eq!(index.search(&options).unwrap().len(), 3);
+        options.query = "museum -amber".into();
+        assert_eq!(index.search(&options).unwrap()[0].1.doc_id, 1);
+        options.query = "\"amber moth\"".into();
+        assert_eq!(index.search(&options).unwrap().len(), 1);
+        options.query = "museum".into();
+        options.role = Some("assistant".into());
+        assert!(index.search(&options).unwrap().is_empty());
+    }
+
+    #[test]
+    fn relevance_prefers_conversation_text_but_keeps_explicit_tool_searches() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create(temp.path()).unwrap();
+        let mut writer = index.writer().unwrap();
+        for (id, role) in [(1, "assistant"), (2, "tool_use"), (3, "tool_result")] {
+            let mut record = test_record(id, "AURORA17 is a blue ceramic bowl.");
+            record.role = role.into();
+            index.add_record(&mut writer, &record).unwrap();
+        }
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        let mut options = QueryOptions {
+            query: "AURORA17".into(),
+            project: None,
+            role: None,
+            tool: None,
+            session_id: None,
+            session_scope: None,
+            source: None,
+            since: None,
+            until: None,
+            limit: 10,
+        };
+        let hits = index.search(&options).unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].1.doc_id, 1);
+        assert!(hits[0].0 > hits[1].0);
+        options.role = Some("tool_result".into());
+        let hits = index.search(&options).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1.doc_id, 3);
+    }
+
+    #[test]
     fn existing_default_tokenizer_is_preserved_until_rebuild() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().join("index");
@@ -4211,6 +4523,208 @@ mod tests {
                 })
                 .expect("search adopted generation")
                 .len(),
+            1
+        );
+    }
+
+    fn create_incompatible_dictionary_index(dir: &Path) -> PathBuf {
+        let mut schema = serde_json::to_value(build_schema().unwrap()).unwrap();
+        let fields = schema.as_array_mut().unwrap();
+        let text = fields.remove(
+            fields
+                .iter()
+                .position(|field| field["name"] == "text")
+                .unwrap(),
+        );
+        // Put text last so its dictionary type is immediately before the composite footer.
+        fields.push(text);
+        let schema: Schema = serde_json::from_value(schema).unwrap();
+        drop(Index::create_in_dir(dir, schema).unwrap());
+        let legacy = SearchIndex::open_or_create(dir).unwrap();
+        let mut writer = legacy.writer().unwrap();
+        legacy
+            .add_record(&mut writer, &test_record(1, "preserved"))
+            .unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        let segment = legacy
+            .index
+            .segment(legacy.index.searchable_segment_metas().unwrap().remove(0));
+        let component = tantivy::SegmentComponent::Terms;
+        let bytes = segment.open_read(component).unwrap().read_bytes().unwrap();
+        let footer_length =
+            u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap()) as usize;
+        let dictionary_type_offset = bytes.len() - 4 - footer_length - 4;
+        assert_eq!(
+            &bytes[dictionary_type_offset..dictionary_type_offset + 4],
+            &2_u32.to_le_bytes()
+        );
+        let path = dir.join(segment.relative_path(component));
+        drop(segment);
+        drop(bytes);
+        drop(legacy);
+        let mut contents = fs::read(&path).unwrap();
+        // FST's type tag is rejected before the dictionary payload is decoded.
+        contents[dictionary_type_offset..dictionary_type_offset + 4]
+            .copy_from_slice(&1_u32.to_le_bytes());
+        fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn legacy_open_reports_incompatible_term_dictionaries() {
+        let temp = tempfile::tempdir().unwrap();
+        create_incompatible_dictionary_index(temp.path());
+        let error = SearchIndex::open_or_create(temp.path())
+            .err()
+            .expect("incompatible legacy index must fail");
+        assert!(error.to_string().contains("term dictionaries"));
+    }
+
+    #[test]
+    fn incompatible_ingest_attempts_do_not_accumulate_segment_owners() {
+        let temp = tempfile::tempdir().unwrap();
+        let segment = create_incompatible_dictionary_index(temp.path());
+        let original = fs::read(&segment).unwrap();
+        let metadata = fs::read(temp.path().join("meta.json")).unwrap();
+        let mut owner_counts = Vec::new();
+        for _ in 0..3 {
+            let error = SearchIndex::open_or_create_for_ingest(temp.path())
+                .err()
+                .expect("incompatible ingest must fail");
+            assert!(error.to_string().contains("term dictionaries"));
+            let owners = fs::read_dir(temp.path().join("segments"))
+                .unwrap()
+                .filter(|entry| entry.as_ref().unwrap().file_type().unwrap().is_dir())
+                .count();
+            owner_counts.push(owners);
+            assert_eq!(fs::read(&segment).unwrap(), original);
+            assert_eq!(fs::read(temp.path().join("meta.json")).unwrap(), metadata);
+        }
+        assert_eq!(
+            owner_counts,
+            [0, 0, 0],
+            "failed attempts accumulated adopted segment owners"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&segment).unwrap().nlink(), 1);
+        }
+    }
+
+    #[test]
+    fn failed_staging_cleans_partial_legacy_adoption() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = SearchIndex::open_or_create(temp.path()).unwrap();
+        let mut writer = legacy.writer().unwrap();
+        legacy
+            .add_record(&mut writer, &test_record(1, "preserved"))
+            .unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        let _store_guard = storage::lock_store(temp.path()).unwrap();
+        let owner = new_generation_name();
+        let staging = temp
+            .path()
+            .join(GENERATIONS_DIR)
+            .join(format!(".{owner}.tmp"));
+        fs::create_dir_all(staging.join("meta.json")).unwrap();
+        let cleanup = StagingCleanup {
+            staging_dir: staging.clone(),
+            segment_owner: temp.path().join("segments").join(&owner),
+        };
+        // Adoption succeeds, then metadata copying fails against this directory.
+        assert!(
+            storage::SharedDirectory::stage(temp.path(), &staging, Some(temp.path()), &owner)
+                .is_err()
+        );
+        assert!(cleanup.segment_owner.is_dir());
+        drop(cleanup);
+        assert!(!staging.exists());
+        assert!(!temp.path().join("segments").join(owner).exists());
+        assert_eq!(legacy.doc_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn abandoned_staging_removes_only_its_own_shared_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = SearchIndex::open_or_create_for_ingest(temp.path()).unwrap();
+        let mut writer = first.writer().unwrap();
+        first
+            .add_record(&mut writer, &test_record(1, "preserved"))
+            .unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        first.publish_generation().unwrap();
+        let current = fs::read(temp.path().join(CURRENT_FILE)).unwrap();
+        let reader = SearchIndex::open_or_create(temp.path()).unwrap();
+        let update = SearchIndex::open_or_create_for_ingest(temp.path()).unwrap();
+        let mut writer = update.writer().unwrap();
+        update
+            .add_record(&mut writer, &test_record(2, "abandoned"))
+            .unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        let pending = update.pending_generation.as_ref().unwrap();
+        pending
+            .directory
+            .prepare_publication(
+                temp.path(),
+                &pending.generation_name,
+                &committed_files(&update.index).unwrap(),
+            )
+            .unwrap();
+        let abandoned_owner = pending._cleanup.segment_owner.clone();
+        assert!(abandoned_owner.is_dir());
+        drop(update);
+        assert!(!abandoned_owner.exists());
+        assert_eq!(fs::read(temp.path().join(CURRENT_FILE)).unwrap(), current);
+        assert_eq!(reader.doc_count().unwrap(), 1);
+        assert_eq!(
+            SearchIndex::open_or_create(temp.path())
+                .unwrap()
+                .doc_count()
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_publication_after_rename_preserves_current_segment_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create_for_ingest(temp.path()).unwrap();
+        let mut writer = index.writer().unwrap();
+        index
+            .add_record(&mut writer, &test_record(1, "preserved"))
+            .unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        let pending = index.pending_generation.as_ref().unwrap();
+        pending
+            .directory
+            .prepare_publication(
+                temp.path(),
+                &pending.generation_name,
+                &committed_files(&index.index).unwrap(),
+            )
+            .unwrap();
+        let owner = pending._cleanup.segment_owner.clone();
+        let published = temp
+            .path()
+            .join(GENERATIONS_DIR)
+            .join(&pending.generation_name);
+        fs::rename(&pending.staging_dir, &published).unwrap();
+        atomic_write_current(temp.path(), &pending.generation_name).unwrap();
+        // Model a sync failure after CURRENT changed but before published was marked.
+        assert!(!pending.published.load(AtomicOrdering::Acquire));
+        drop(index);
+        assert!(owner.is_dir());
+        assert_eq!(
+            SearchIndex::open_or_create(temp.path())
+                .unwrap()
+                .doc_count()
+                .unwrap(),
             1
         );
     }

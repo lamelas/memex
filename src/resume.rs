@@ -65,7 +65,8 @@ pub fn resume_template(config: &UserConfig, source: SourceKind, remote: bool) ->
         SourceKind::Bob => config.bob_resume_cmd.clone(),
         // ZCode sessions resume in the desktop app, not a CLI.
         SourceKind::Zcode => None,
-        SourceKind::Kiro => None,
+        // Kiro local sessions are scoped to the directory they started in.
+        SourceKind::Kiro => config.kiro_resume_cmd.clone(),
         // KiloCode sessions resume with `kilo --session <id>` in a project directory.
         SourceKind::Kilocode => config.kilocode_resume_cmd.clone(),
     };
@@ -114,6 +115,9 @@ pub fn default_resume_template(cmd: &str, remote: bool) -> Option<String> {
         }
         "kilocode" if remote || find_in_path("kilo").is_some() => {
             Some("cd {cwd_shell} && kilo --session {session_id}".to_string())
+        }
+        "kiro" if remote || find_in_path("kiro-cli").is_some() => {
+            Some("cd {cwd_shell} && kiro-cli chat --resume-id {session_id}".to_string())
         }
         _ => None,
     }
@@ -232,6 +236,14 @@ mod tests {
         assert_eq!(
             default_resume_template("opencode", true).as_deref(),
             Some("opencode --session {session_id}")
+        );
+    }
+
+    #[test]
+    fn remote_kiro_default_resumes_by_id_in_cwd() {
+        assert_eq!(
+            default_resume_template("kiro", true).as_deref(),
+            Some("cd {cwd_shell} && kiro-cli chat --resume-id {session_id}")
         );
     }
 

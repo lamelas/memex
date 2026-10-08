@@ -358,6 +358,7 @@ fn state_store_roots() -> Vec<PathBuf> {
     roots.extend(antigravity::profile_roots());
     roots.extend(bob::roots());
     roots.extend(kilocode::roots());
+    roots.push(kiro::sessions_root());
     roots
 }
 
